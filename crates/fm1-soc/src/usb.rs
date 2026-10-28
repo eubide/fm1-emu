@@ -29,8 +29,9 @@
 //! (`midi_take`). USB audio (`audio_record`, fm1-live FM1_USB_WAV): a USB Audio Class 1
 //! device's audio streaming interface with an isochronous IN endpoint is recorded as a
 //! computer's recording program does: SET_INTERFACE to the alternate setting that has the
-//! endpoint, SET_CUR of its sampling frequency (when the format lists the rate asked for),
-//! then one isochronous IN transaction a frame, the PCM into `audio`. An isochronous IN
+//! endpoint, SET_CUR of its sampling frequency (when its class-specific endpoint descriptor has
+//! the control and the format offers the rate asked for; refused, the device's own rate), then
+//! one isochronous IN transaction a frame, the PCM into `audio`. An isochronous IN
 //! endpoint (TXCSR2 bit 6) is never NAKed: with no packet queued it sends a zero-length one
 //! and sets UnderRun (TXCSR1 bit 2), which the firmware clears with its next TXCSR1 write. The device only answers at its own address (FADDR), so a firmware that gets
 //! SET_ADDRESS wrong drops off as it would on a real bus.
@@ -187,7 +188,23 @@ pub struct AudioStream {
     pub channels: u8,
     /// Bytes per sample (bSubframeSize).
     pub sample_bytes: u8,
+    /// The discrete rates, or a continuous range (`rate_range`, `rates` empty).
     pub rates: Vec<u32>,
+    pub rate_range: Option<(u32, u32)>,
+    /// Its class-specific endpoint descriptor has the sampling frequency control (SET_CUR).
+    pub rate_control: bool,
+}
+
+impl AudioStream {
+    /// Does the format offer `hz`?
+    pub fn offers(&self, hz: u32) -> bool {
+        self.rates.contains(&hz) || self.rate_range.is_some_and(|(lo, hi)| (lo..=hi).contains(&hz))
+    }
+
+    /// The rate it streams at unasked: its first (or its range's lowest).
+    pub fn default_rate(&self) -> u32 {
+        self.rates.first().copied().or(self.rate_range.map(|r| r.0)).unwrap_or(0)
+    }
 }
 
 /// Something that happened on the bus, for the front end.
@@ -266,10 +283,15 @@ impl Usb {
         self.cable = true;
         self.sie_cycles = (hz * ns / 1_000_000_000).max(1);
         self.trace = std::env::var_os("FM1_USB_TRACE").is_some();
-        if std::env::var_os("FM1_USB_WAV").is_some() {
-            let rate = std::env::var("FM1_USB_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(44_100);
-            self.audio_record(rate);
-        }
+    }
+
+    /// After a chip reset (a fresh `Usb`, plugged again if `self` was): the recording goes on
+    /// (what was asked for, the samples so far and their counts).
+    pub fn keep_recording(&mut self, old: &mut Usb) {
+        self.audio_want = old.audio_want;
+        self.audio = std::mem::take(&mut old.audio);
+        (self.audio_rate, self.audio_packets, self.audio_empty, self.audio_underruns) =
+            (old.audio_rate, old.audio_packets, old.audio_empty, old.audio_underruns);
     }
 
     /// Record the device's USB audio (if it has any) at `rate` Hz, as a computer's recording
@@ -951,18 +973,24 @@ impl Usb {
                     Ok(None) => {}
                     Ok(Some(_)) => {
                         let rate = self.audio_want.unwrap_or(44_100);
-                        let lists = self.audio_stream.as_ref().is_some_and(|a| a.rates.contains(&rate));
-                        self.audio_step = if step == AudioStep::SetInterface && lists {
+                        let Some(a) = self.audio_stream.clone() else { return };
+                        // SET_CUR only where the endpoint has the control and the format the rate;
+                        // else the device's own rate
+                        self.audio_step = if step == AudioStep::SetInterface && a.rate_control && a.offers(rate) {
                             AudioStep::SetRate
                         } else {
-                            // a rate the format does not list is not asked for: the device's own
-                            self.audio_rate = if lists { rate } else {
-                                self.audio_stream.as_ref().and_then(|a| a.rates.first().copied()).unwrap_or(0)
-                            };
+                            self.audio_rate = if step == AudioStep::SetRate { rate } else { a.default_rate() };
                             self.log(|| format!("audio: streaming at {} Hz", self.audio_rate));
                             AudioStep::Streaming
                         };
                         self.audio_control(self.audio_step);
+                    }
+                    Err(e) if step == AudioStep::SetRate => {
+                        // (refused: the stream at the device's own rate)
+                        self.ctl = None;
+                        self.audio_rate = self.audio_stream.as_ref().map_or(0, |a| a.default_rate());
+                        self.log(|| format!("audio: SET_CUR: {e}; streaming at {} Hz", self.audio_rate));
+                        self.audio_step = AudioStep::Streaming;
                     }
                     Err(e) => {
                         self.log(|| format!("audio: {e}"));
@@ -979,8 +1007,10 @@ impl Usb {
                     if d.is_empty() {
                         self.audio_empty += 1;
                     }
-                    if self.trace && d.len() % 4 == 0 && !(43..=46).contains(&(d.len() / 4)) {
-                        self.log(|| format!("audio: a packet of {} frames", d.len() / 4));
+                    let frame = (a.channels as usize * a.sample_bytes as usize).max(1);
+                    let per_ms = self.audio_rate as usize / 1000;
+                    if self.trace && !(per_ms.saturating_sub(2)..=per_ms + 2).contains(&(d.len() / frame)) {
+                        self.log(|| format!("audio: a packet of {} frames ({} B, max {})", d.len() / frame, d.len(), a.max_packet));
                     }
                     if a.sample_bytes == 2 {
                         self.audio.extend(d.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
@@ -992,11 +1022,14 @@ impl Usb {
 }
 
 /// The audio streaming interface (class 1, subclass 2) of a configuration: the first
-/// alternate setting with an isochronous IN endpoint, and the Type I format descriptor
-/// (CS_INTERFACE, FORMAT_TYPE) in it.
+/// alternate setting with an isochronous IN data endpoint (one its class-specific endpoint
+/// descriptor follows: a synch endpoint has none) and no isochronous OUT one (a playback
+/// interface), and the Type I format descriptor (CS_INTERFACE, FORMAT_TYPE) in it.
 pub fn find_audio(conf: &[u8]) -> Option<AudioStream> {
     let mut i = 0usize;
-    let mut cur: Option<AudioStream> = None;
+    // the setting being read, its endpoint waiting for its class-specific descriptor, an iso OUT
+    let (mut cur, mut pending, mut out): (Option<AudioStream>, Option<(u8, u16)>, bool) = (None, None, false);
+    let done = |a: &Option<AudioStream>, out: bool| a.as_ref().is_some_and(|a| a.ep != 0 && !out);
     while i + 2 <= conf.len() {
         let (len, ty) = (conf[i] as usize, conf[i + 1]);
         if len < 2 || i + len > conf.len() {
@@ -1005,10 +1038,11 @@ pub fn find_audio(conf: &[u8]) -> Option<AudioStream> {
         let d = &conf[i..i + len];
         match ty {
             4 if len >= 9 => {
-                if cur.as_ref().is_some_and(|a| a.ep != 0) {
+                if done(&cur, out) {
                     break; // the setting before had it all
                 }
                 cur = (d[5] == 1 && d[6] == 2).then(|| AudioStream { interface: d[2], alt: d[3], ..Default::default() });
+                (pending, out) = (None, false);
             }
             0x24 if len >= 8 && d[2] == 2 && d[3] == 1 => {
                 if let Some(a) = cur.as_mut() {
@@ -1016,24 +1050,32 @@ pub fn find_audio(conf: &[u8]) -> Option<AudioStream> {
                     a.sample_bytes = d[5];
                     let n = d[7] as usize;
                     let at = |k: usize| u32::from(d[k]) | u32::from(d[k + 1]) << 8 | u32::from(d[k + 2]) << 16;
-                    a.rates = if n == 0 && len >= 14 {
-                        vec![at(8), at(11)] // a continuous range: its ends
+                    if n == 0 && len >= 14 {
+                        a.rate_range = Some((at(8), at(11))); // a continuous range
                     } else {
-                        (0..n).filter(|k| 8 + 3 * k + 3 <= len).map(|k| at(8 + 3 * k)).collect()
-                    };
+                        a.rates = (0..n).filter(|k| 8 + 3 * k + 3 <= len).map(|k| at(8 + 3 * k)).collect();
+                    }
                 }
             }
-            5 if len >= 7 && d[2] & 0x80 != 0 && d[3] & 3 == 1 => {
-                if let Some(a) = cur.as_mut() {
-                    a.ep = d[2];
-                    a.max_packet = u16::from_le_bytes([d[4], d[5]]);
+            5 if len >= 7 && d[3] & 3 == 1 => {
+                pending = None;
+                if d[2] & 0x80 == 0 {
+                    out = true;
+                } else if cur.as_ref().is_some_and(|a| a.ep == 0) {
+                    pending = Some((d[2], u16::from_le_bytes([d[4], d[5]])));
                 }
             }
-            _ => {}
+            0x25 if len >= 4 && d[2] == 1 => {
+                // EP_GENERAL right after the endpoint: a data endpoint; bit 0, the rate's control
+                if let (Some(a), Some((ep, maxp))) = (cur.as_mut(), pending.take()) {
+                    (a.ep, a.max_packet, a.rate_control) = (ep, maxp, d[3] & 1 != 0);
+                }
+            }
+            _ => pending = None,
         }
         i += len;
     }
-    cur.filter(|a| a.ep != 0)
+    if done(&cur, out) { cur } else { None }
 }
 
 /// A complete MIDI message as USB-MIDI event packets (cable 0).
@@ -1136,13 +1178,15 @@ mod tests {
         cur_data: bool,
         next: u16,
         feed: bool,
+        /// SET_CUR stalled (a device with a fixed rate).
+        refuse_cur: bool,
         /// The rest of a descriptor longer than a packet (EP0 sends 64 bytes at a time).
         rest: Vec<u8>,
     }
     impl Fw {
         fn new(conf: Vec<u8>) -> Self {
             Fw { t: 0, conf, addr: None, got: Vec::new(), alt: 0, rate: 0, cur_data: false, next: 0, feed: true,
-                 rest: Vec::new() }
+                 refuse_cur: false, rest: Vec::new() }
         }
         fn w(&mut self, u: &mut Usb, r: u32, v: u8) {
             u.write(USB_LO + 4, r << 8 | v as u32, self.t);
@@ -1207,6 +1251,7 @@ mod tests {
                             self.w(u, S_INDEX, 0);
                             self.w(u, S_CSR0, 0x40 | 0x08);
                         }
+                        (0x22, 0x01) if self.refuse_cur => self.w(u, S_CSR0, 0x40 | 0x20), // SendStall
                         (0x22, 0x01) => {
                             self.cur_data = true; // the data stage follows
                             self.w(u, S_CSR0, 0x40);
@@ -1318,14 +1363,21 @@ mod tests {
     /// endpoint, alt 1 with an isochronous IN endpoint 0x84 and a Type I format of 2 channels of
     /// 16 bits at 44100 or 48000 Hz.
     fn audio_conf() -> Vec<u8> {
+        audio_conf_with(true, &[2, 0x44, 0xac, 0x00, 0x80, 0xbb, 0x00])
+    }
+
+    /// `audio_conf` with or without SET_CUR (the CS endpoint's bit 0), and the format's rates
+    /// (bSamFreqType and its 3-byte rates; 0: a range, low and high).
+    fn audio_conf_with(rate_control: bool, rates: &[u8]) -> Vec<u8> {
         let mut c = midi_conf(0);
         c[4] = 3;
         c.extend([9, 4, 2, 0, 0, 1, 2, 0, 0]);
         c.extend([9, 4, 2, 1, 1, 1, 2, 0, 0]);
         c.extend([7, 0x24, 1, 2, 1, 1, 0]);
-        c.extend([14, 0x24, 2, 1, 2, 2, 16, 2, 0x44, 0xac, 0x00, 0x80, 0xbb, 0x00]);
+        c.extend([(8 + rates.len() - 1) as u8, 0x24, 2, 1, 2, 2, 16]);
+        c.extend(rates);
         c.extend([9, 5, 0x84, 0x05, 196, 0, 1, 0, 0]);
-        c.extend([7, 0x25, 1, 0, 0, 0, 0]);
+        c.extend([7, 0x25, 1, rate_control as u8, 0, 0, 0]);
         let n = c.len() as u16;
         c[2..4].copy_from_slice(&n.to_le_bytes());
         c
@@ -1337,8 +1389,25 @@ mod tests {
     #[test]
     fn a_usb_audio_device_is_recorded() {
         assert_eq!(find_audio(&audio_conf()), Some(AudioStream { interface: 2, alt: 1, ep: 0x84, max_packet: 196,
-                                                                channels: 2, sample_bytes: 2, rates: vec![44_100, 48_000] }));
+                                                                channels: 2, sample_bytes: 2, rates: vec![44_100, 48_000],
+                                                                rate_range: None, rate_control: true }));
         assert_eq!(find_audio(&midi_conf(45)), None);
+        // a continuous range offers what lies in it
+        let a = find_audio(&audio_conf_with(true, &[0, 0x40, 0x1f, 0x00, 0x80, 0xbb, 0x00])).unwrap();
+        assert_eq!((a.rate_range, a.offers(44_100), a.offers(96_000), a.default_rate()), (Some((8_000, 48_000)), true, false, 8_000));
+        // a playback interface: an iso OUT data endpoint and its iso IN feedback endpoint (no CS endpoint
+        // descriptor after it) is no recording
+        let mut p = midi_conf(0);
+        p[4] = 3;
+        p.extend([9, 4, 2, 0, 0, 1, 2, 0, 0]);
+        p.extend([9, 4, 2, 1, 2, 1, 2, 0, 0]);
+        p.extend([11, 0x24, 2, 1, 2, 2, 16, 1, 0x44, 0xac, 0x00]);
+        p.extend([9, 5, 0x03, 0x05, 196, 0, 1, 0, 0x83]);
+        p.extend([7, 0x25, 1, 1, 0, 0, 0]);
+        p.extend([9, 5, 0x83, 0x11, 3, 0, 1, 1, 0]);
+        let n = p.len() as u16;
+        p[2..4].copy_from_slice(&n.to_le_bytes());
+        assert_eq!(find_audio(&p), None);
         let (mut u, mut fw, mut ram) = device(audio_conf());
         u.audio_record(48_000);
         run(&mut u, &mut fw, &mut ram, 200);
@@ -1362,6 +1431,27 @@ mod tests {
         let (mut u, mut fw, mut ram) = device(audio_conf());
         run(&mut u, &mut fw, &mut ram, 200);
         assert_eq!((fw.alt, u.audio_packets), (0, 0));
+
+        // no rate control on the endpoint: no SET_CUR, its own (first) rate
+        let (mut u, mut fw, mut ram) = device(audio_conf_with(false, &[2, 0x44, 0xac, 0x00, 0x80, 0xbb, 0x00]));
+        u.audio_record(48_000);
+        run(&mut u, &mut fw, &mut ram, 200);
+        assert_eq!((fw.alt, fw.rate, u.audio_rate), (1, 0, 44_100));
+        assert!(u.audio_packets > 10);
+
+        // SET_CUR stalled: the stream at the device's own rate all the same
+        let (mut u, mut fw, mut ram) = device(audio_conf());
+        fw.refuse_cur = true;
+        u.audio_record(48_000);
+        run(&mut u, &mut fw, &mut ram, 200);
+        assert_eq!((fw.alt, fw.rate, u.audio_rate), (1, 0, 44_100));
+        assert!(u.audio_packets > 10, "{} packets", u.audio_packets);
+
+        // a chip reset: a fresh controller (plugged again), the recording kept
+        let n = u.audio.len();
+        let mut fresh = Usb { cable: true, sie_cycles: 1, ..Default::default() };
+        fresh.keep_recording(&mut u);
+        assert_eq!((fresh.audio.len(), fresh.audio_want, fresh.audio_rate), (n, Some(48_000), 44_100));
     }
 
     /// A configuration whose wTotalLength is too short for one (or 0) fails the enumeration

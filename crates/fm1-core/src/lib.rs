@@ -845,9 +845,10 @@ impl Cpu {
         if let Some(i) = self.pred_skips.iter().position(|&(te, _)| te == pc) {
             self.pc = self.pred_skips.remove(i).1;
         }
-        let pc = self.pc;
-        // (as `finish`: out past the then-part, or back before where the prefix began)
-        self.pred_skips.retain(|&(te, _)| pc <= te && pc >= entry);
+        let (pc, rets) = (self.pc, self.rets);
+        // (as `finish`: out past the then-part, or a goto back out of it; the prefix lies inside
+        // the then-part and ends at its jump, so its entry stands for the jump's place)
+        self.pred_skips.retain(|&(te, _)| pc <= te && !pred_left_back(entry, pc, te, rets));
         pc
     }
 
@@ -896,8 +897,8 @@ impl Cpu {
             self.insn_count += 1;
             let (te, ee) = self.pred_skips[0];
             let mut still = true;
-            if pc < at {
-                self.pred_skips.clear(); // back out of the construct (`finish`)
+            if pred_left_back(at, pc, te, self.rets) {
+                self.pred_skips.clear(); // a goto back out of the construct (`finish`)
                 still = false;
             } else if pc >= te {
                 if pc == te {
@@ -3355,10 +3356,10 @@ impl Cpu {
                 let (_, ee) = self.pred_skips.remove(i);
                 self.pc = ee;
             }
-            let pc = self.pc;
-            // a branch out of the construct abandons its pending skip: past its then-part, or
-            // back before this instruction (clang's tail call `if (c) { goto f } else { .. }`)
-            self.pred_skips.retain(|&(te, _)| pc <= te && pc >= at);
+            let (pc, rets, back) = (self.pc, self.rets, jumped.is_some());
+            // a branch out of the construct abandons its pending skip: past its then-part, or a
+            // goto back out of it (`pred_left_back`)
+            self.pred_skips.retain(|&(te, _)| pc <= te && !(back && pred_left_back(at, pc, te, rets)));
         }
         if self.rep_end != 0 && jumped.is_none() && self.pc == self.rep_end {
             // fell off the end of a rep block: count down, loop or finish
@@ -3958,6 +3959,18 @@ fn decode_pair_mem(raw: u64) -> PairMem {
         let index = Some(((raw >> 24) & 0xf) as usize);
         PairMem { pair, store, base, off: 0, index, pre: raw & 6 == 4, post: raw & 6 == 6 }
     }
+}
+
+/// A then-part is 1..4 instructions (`decode_if_block`): at most this many bytes.
+const THEN_MAX: u32 = 32;
+
+/// Did a jump from `at` to `pc` leave a then-part ending at `te` backwards (clang's tail call
+/// `if (c) { goto f } else { .. }` with f before it)? Only from an instruction inside the
+/// then-part, and not a call: one returns into the construct (`rets` just set inside it), and
+/// a callee's own loops (`at` outside the then-part) leave nothing.
+#[inline]
+fn pred_left_back(at: u32, pc: u32, te: u32, rets: u32) -> bool {
+    pc < at && at < te && te - at <= THEN_MAX && !(rets > at && rets <= te)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4826,57 +4839,95 @@ mod tests {
         }
     }
 
+    /// Two programs with an if-else block at `base + 0x80`: `b0 e8 00 10` if (r0 != 0) { 2 units }
+    /// else { `40 20` r0 = 0 }, then `c6 21` r6 += 1 past it; f before the block at `base + 0x10`:
+    /// `c5 21` r5 += 1, then `c5 21` again (tail) or `80 00` rts (call). The then-part is
+    /// `ff ea ..` goto f (clang's tail call, as fm1-dock's c1_wait) or `bf ea ..` call f.
+    fn then_part_programs(base: u32) -> [(Vec<u8>, bool); 2] {
+        let off = ((0x10i32 - 0x88) / 2) as i16 as u16;
+        [(0xffu8, false), (0xbf, true)].map(|(op, call)| {
+            let mut mem = vec![0u8; 0x100];
+            mem[0x10..0x14].copy_from_slice(&[0xc5, 0x21, if call { 0x80 } else { 0xc5 }, if call { 0x00 } else { 0x21 }]);
+            mem[0x80..0x84].copy_from_slice(&[0xb0, 0xe8, 0x00, 0x10]);
+            mem[0x84..0x88].copy_from_slice(&[op, 0xea, off as u8, (off >> 8) as u8]);
+            mem[0x88..0x8a].copy_from_slice(&[0x40, 0x20]);
+            mem[0x8a..0x8c].copy_from_slice(&[0xc6, 0x21]);
+            // (each run ends at a goto to itself: `ff ea fe ff`)
+            mem[0x14..0x18].copy_from_slice(&[0xff, 0xea, 0xfe, 0xff]);
+            mem[0x8c..0x90].copy_from_slice(&[0xff, 0xea, 0xfe, 0xff]);
+            let _ = base;
+            (mem, call)
+        })
+    }
+
     #[test]
     fn a_goto_back_out_of_a_then_part_ends_the_construct() {
-        // clang's tail call from fm1-dock (h_c1_wait): `b0 e8 00 10` if (r0 != 0) { `ff ea ..`
-        // goto f } else { `40 20` r0 = 0 }, f before it. The goto leaves the construct: its
-        // pending skip (and the interrupts it holds back) must not follow it into f, where an
-        // audio ISR waited ~0.7 ms for the other core with TIMER5 held off.
-        let mut mem = vec![0u8; 0x100];
-        mem[0x10..0x12].copy_from_slice(&[0xc5, 0x21]); // f: r5 += 1
-        mem[0x12..0x14].copy_from_slice(&[0xc5, 0x21]);
-        mem[0x80..0x84].copy_from_slice(&[0xb0, 0xe8, 0x00, 0x10]);
-        let off = ((0x10i32 - 0x88) / 2) as i16 as u16;
-        mem[0x84..0x88].copy_from_slice(&[0xff, 0xea, off as u8, (off >> 8) as u8]);
-        mem[0x88..0x8a].copy_from_slice(&[0x40, 0x20]);
-        for fast in [false, true] {
+        // The goto leaves the construct: its pending skip (and the interrupts it holds back) must
+        // not follow it into f, where fm1-dock's audio ISR waited ~0.7 ms for the other core with
+        // TIMER5 held off. A call into f returns into the construct: the skip stays, and at the
+        // then-part's end it skips the else part (as before).
+        for (mem, call) in then_part_programs(0) {
             let mut ram = FlatRam::new(mem.clone());
             let mut cpu = Cpu::new(0x80);
             cpu.regs[0] = 1;
             cpu.ie = true;
             cpu.sreg_store[0] |= 0x100;
             cpu.step(&mut ram).unwrap();
-            assert!(!cpu.pred_skips.is_empty(), "in the then-part");
-            assert!(!cpu.irq_ready(4), "no interrupt inside the construct");
-            if fast {
-                // (as run_blocks: a step where run_fast runs nothing)
-                for _ in 0..16 {
-                    if cpu.pc == 0x12 {
-                        break;
-                    }
-                    if cpu.run_fast(&mut ram, 1).unwrap().0 == 0 {
-                        cpu.step(&mut ram).unwrap();
-                    }
+            assert!(!cpu.pred_skips.is_empty() && !cpu.irq_ready(4), "call {call}: in the then-part, no interrupt");
+            cpu.step(&mut ram).unwrap();
+            assert_eq!(cpu.pc, 0x10, "call {call}: into f");
+            assert_eq!(cpu.pred_skips.is_empty(), !call, "call {call}: a goto leaves the construct, a call does not");
+            assert_eq!(cpu.irq_ready(4), !call, "call {call}");
+            if call {
+                for _ in 0..3 {
+                    cpu.step(&mut ram).unwrap(); // r5 += 1, rts (to the then-part's end: the skip), r6 += 1
                 }
-                assert_eq!(cpu.pc, 0x12, "into f, one instruction of it run");
-            } else {
-                cpu.step(&mut ram).unwrap();
-                assert_eq!(cpu.pc, 0x10, "the goto");
+                assert_eq!((cpu.pc, cpu.regs[0], cpu.regs[5], cpu.regs[6]), (0x8c, 1, 1, 1), "the else part skipped");
+                assert!(cpu.pred_skips.is_empty());
+            }
+            // r0 == 0: the else part, then on past the construct
+            let mut ram = FlatRam::new(mem);
+            let mut cpu = Cpu::new(0x80);
+            for _ in 0..3 {
                 cpu.step(&mut ram).unwrap();
             }
-            assert!(cpu.pred_skips.is_empty(), "fast {fast}: the goto left the construct");
-            assert!(cpu.irq_ready(4), "fast {fast}: interrupts again in f");
-            assert_eq!(cpu.regs[5], 1, "fast {fast}");
+            assert_eq!((cpu.pc, cpu.regs[0], cpu.regs[5], cpu.regs[6]), (0x8c, 0, 0, 1), "call {call}: r0 == 0");
+            assert!(cpu.pred_skips.is_empty());
         }
-        // r0 == 0: the else part, then on past the construct
-        let mut ram = FlatRam::new(mem);
-        let mut cpu = Cpu::new(0x80);
-        cpu.regs[0] = 0;
-        cpu.regs[3] = 7;
-        cpu.step(&mut ram).unwrap();
-        cpu.step(&mut ram).unwrap();
-        assert_eq!((cpu.pc, cpu.regs[0]), (0x8a, 0));
-        assert!(cpu.pred_skips.is_empty());
+    }
+
+    /// `a_goto_back_out_of_a_then_part_ends_the_construct` through run_fast, interpreted and
+    /// compiled, from XIP (where blocks are built).
+    #[cfg(native_jit)]
+    #[test]
+    fn a_goto_back_out_of_a_then_part_ends_the_construct_in_blocks() {
+        for (mem, call) in then_part_programs(0x0200_0000) {
+            for jit in [false, true] {
+                let mut xip = mem.clone();
+                xip.resize(0x200, 0);
+                let mut bus = Clocked { ram: vec![0; 0x1000], xip, cycles: 0, next_due: u64::MAX, irq: false, due_on_mmio: false, writes: 0 };
+                let mut cpu = Cpu::new(0x0200_0080);
+                (cpu.jit_on, cpu.profile) = (jit, true);
+                let mut fast = 0;
+                // (round after round, so that the blocks get hot and compiled)
+                for round in 0..300u32 {
+                    (cpu.pc, cpu.regs[0], cpu.regs[5], cpu.regs[6]) = (0x0200_0080, 1, 0, 0);
+                    cpu.pred_skips.clear();
+                    for _ in 0..12 {
+                        match cpu.run_fast(&mut bus, 1 + round % 4).unwrap().0 {
+                            0 => cpu.step(&mut bus).map(|_| ()).unwrap(),
+                            k => fast += k,
+                        }
+                    }
+                    // at the end, round its goto to itself: the goto's case in f, the call's past the block
+                    let (end, r5) = if call { (0x0200_008c, 1) } else { (0x0200_0014, 2) };
+                    assert_eq!((cpu.pc, cpu.regs[0], cpu.regs[5], cpu.regs[6]), (end, 1, r5, call as u32),
+                               "call {call}, jit {jit}, round {round}");
+                    assert!(cpu.pred_skips.is_empty(), "call {call}, jit {jit}, round {round}: the construct is over");
+                }
+                assert!(fast > 0 && (!jit || cpu.jit_insns > 0), "call {call}, jit {jit}: {fast} fast, {} compiled", cpu.jit_insns);
+            }
+        }
     }
 
     #[test]

@@ -296,6 +296,7 @@ fn bench(o: &Opts, ms: u64) {
         Ok(m) => m,
         Err(e) => { eprintln!("cannot read {}: {e}", o.bin); std::process::exit(1); },
     };
+    usb_audio_arm(&mut m);
     if std::env::var("FM1_BENCH_NOKEYS").is_ok() {
         m.soc.periph.script.clear();
     } else if script_keys(&mut m) {
@@ -325,6 +326,7 @@ fn bench(o: &Opts, ms: u64) {
         if sample && m.soc.periph.ms() > ms / 2 {
             for _ in 0..1000 {
                 if let Err(e) = m.run(97) {
+                    usb_audio_save(&m);
                     halted(&e);
                     std::process::exit(1);
                 }
@@ -334,6 +336,7 @@ fn bench(o: &Opts, ms: u64) {
             continue;
         }
         if let Err(e) = m.run(100_000) {
+            usb_audio_save(&m);
             halted(&e);
             std::process::exit(1);
         }
@@ -534,6 +537,7 @@ fn shot(o: &Opts, ms: u64) {
         Ok(m) => m,
         Err(e) => return eprintln!("cannot read {}: {e}", o.bin),
     };
+    usb_audio_arm(&mut m);
     if std::env::var("FM1_NO_SKIP").is_ok() {
         m.soc.periph.skip_idle = false;
     }
@@ -565,6 +569,7 @@ fn shot(o: &Opts, ms: u64) {
             m.soc.periph.skip_idle = true;
         }
         if let Err(e) = m.run(100_000) {
+            usb_audio_save(&m);
             return halted(&e);
         }
         usb_headless(&mut m, &mut usb_sends);
@@ -581,6 +586,7 @@ fn shot(o: &Opts, ms: u64) {
     let (mut in_isr, mut total) = (0u64, 0u64);
     while m.soc.periph.ms() < ms {
         if let Err(e) = m.run(1) {
+            usb_audio_save(&m);
             return halted(&e);
         }
         total += 1;
@@ -653,14 +659,29 @@ fn usb_script() -> VecDeque<(u64, Vec<u8>)> {
     q.into()
 }
 
+/// --usb with FM1_USB_WAV=FILE (--bench, --shot): the computer records the device's USB audio,
+/// asking for FM1_USB_RATE (default 44100).
+fn usb_audio_arm(m: &mut Machine) {
+    if std::env::var_os("FM1_USB_WAV").is_some() && m.soc.usb.cable {
+        let rate = std::env::var("FM1_USB_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(44_100);
+        m.soc.usb.audio_record(rate);
+    }
+}
+
 /// --usb with FM1_USB_WAV=FILE: what the computer recorded from the device's USB audio (the
-/// samples as sent, interleaved, s16le, no header; at FM1_USB_RATE if the device offers it).
+/// samples as sent, interleaved as its channels come, s16le, no header).
 fn usb_audio_save(m: &Machine) {
     let Ok(path) = std::env::var("FM1_USB_WAV") else { return };
     let u = &m.soc.usb;
+    if !u.cable {
+        return println!("usb audio: no USB cable (--usb); nothing -> {path}");
+    }
     let Some(a) = &u.audio_stream else {
         return println!("usb audio: the device has no audio streaming interface; nothing -> {path}");
     };
+    if a.sample_bytes != 2 {
+        println!("usb audio: {}-byte samples are not decoded (16-bit only); nothing recorded", a.sample_bytes);
+    }
     let bytes: Vec<u8> = u.audio.iter().flat_map(|s| s.to_le_bytes()).collect();
     let _ = std::fs::write(&path, bytes);
     println!("usb audio: {} ch at {} Hz, {} samples in {} packets ({} empty, {} of them underruns) -> {path}",

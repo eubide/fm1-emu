@@ -470,11 +470,11 @@ impl Soc {
         self.resets += 1;
         self.periph.chip_reset();
         self.p33.chip_reset(cause);
-        let cable = self.usb.cable;
-        self.usb = Default::default();
-        if cable {
+        let mut old = std::mem::take(&mut self.usb);
+        if old.cable {
             self.usb.plug(self.periph.hz);
         }
+        self.usb.keep_recording(&mut old); // (a computer's recording goes on across the reset)
         (self.paused, self.lock_owner, self.cpu1_release, self.cpu1_released_once, self.crc) = ([false; 2], None, false, false, 0);
         self.flash.chip_reset();
         cpu.set_plain_state(&boot.cpu);
