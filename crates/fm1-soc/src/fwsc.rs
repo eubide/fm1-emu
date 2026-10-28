@@ -394,7 +394,15 @@ pub fn usr_fill_defaults(flash: &mut [u8], usr: usize) -> bool {
 /// bytes) into slots `first..first + 32`. Returns how many voices it wrote.
 pub fn usr_load_syx(flash: &mut [u8], usr: usize, syx: &[u8], first: usize) -> Result<usize, String> {
     let data = if syx.len() >= 4104 && syx[0] == 0xf0 && syx[1] == 0x43 && syx[3] == 0x09 {
-        &syx[6..6 + 4096]
+        let data = &syx[6..6 + 4096];
+        if syx[4..6] != [0x20, 0x00] || syx[4103] != 0xf7 {
+            return Err("not a DX7 32-voice bank (bad sysex framing)".into());
+        }
+        let sum = data.iter().fold(0u8, |a, &b| a.wrapping_sub(b)) & 0x7f;
+        if syx[4102] != sum {
+            return Err(format!("DX7 bank checksum mismatch (the file says {:#04x}, the data sums to {sum:#04x})", syx[4102]));
+        }
+        data
     } else if syx.len() == 4096 {
         syx
     } else {
@@ -428,6 +436,40 @@ mod tests {
         // the byte after the header (block n's marker position) must not read as 0x7D
         f[n * 0x30 + 0x2f] = 0x12;
         f
+    }
+
+    /// A DX7 32-voice bulk dump of `data` (4096 bytes), framed and checksummed.
+    fn bulk(data: &[u8]) -> Vec<u8> {
+        let mut m = vec![0xf0, 0x43, 0x00, 0x09, 0x20, 0x00];
+        m.extend_from_slice(data);
+        m.push(data.iter().fold(0u8, |a, &b| a.wrapping_sub(b)) & 0x7f);
+        m.push(0xf7);
+        m
+    }
+
+    #[test]
+    fn a_bulk_dump_loads_its_voices() {
+        let mut flash = vec![0xff; 0x100000];
+        let syx = bulk(&[0x23; 4096]);
+        assert_eq!(usr_load_syx(&mut flash, 0xe0000, &syx, 0), Ok(32));
+        assert_eq!(flash[0xe0000 + USR_VOICES], 0x23);
+    }
+
+    #[test]
+    fn a_bulk_dump_with_a_bad_checksum_is_refused() {
+        let mut flash = vec![0xff; 0x100000];
+        let mut syx = bulk(&[0x23; 4096]);
+        syx[4102] ^= 1;
+        assert!(usr_load_syx(&mut flash, 0xe0000, &syx, 0).unwrap_err().contains("checksum"));
+        assert!(flash.iter().all(|&b| b == 0xff), "nothing written");
+    }
+
+    #[test]
+    fn a_bulk_dump_without_its_end_is_refused() {
+        let mut flash = vec![0xff; 0x100000];
+        let mut syx = bulk(&[0x23; 4096]);
+        syx[4103] = 0;
+        assert!(usr_load_syx(&mut flash, 0xe0000, &syx, 0).is_err());
     }
 
     #[test]
