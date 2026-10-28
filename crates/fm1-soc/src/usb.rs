@@ -33,8 +33,9 @@
 //! the control and the format offers the rate asked for; refused, the device's own rate), then
 //! one isochronous IN transaction a frame, the PCM into `audio`. An isochronous IN
 //! endpoint (TXCSR2 bit 6) is never NAKed: with no packet queued it sends a zero-length one
-//! and sets UnderRun (TXCSR1 bit 2), which the firmware clears with its next TXCSR1 write. The device only answers at its own address (FADDR), so a firmware that gets
-//! SET_ADDRESS wrong drops off as it would on a real bus.
+//! and sets UnderRun (TXCSR1 bit 2), which the firmware clears with its next TXCSR1 write.
+//! The device only answers at its own address (FADDR), so a firmware that gets SET_ADDRESS
+//! wrong drops off as it would on a real bus.
 //!
 //! Not modelled: the USB interrupt. The SIE sets its flags (INTRTX / INTRRX / INTRUSB) but
 //! raises no IRQ line, so a driver that polls them (Felucca's usb.c) enumerates, and one that
