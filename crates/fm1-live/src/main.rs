@@ -515,7 +515,9 @@ fn script_keys(m: &mut Machine) -> bool {
             String::new()
         });
     }
-    fm1_soc::script::queue(&mut m.soc, keys.trim());
+    for k in fm1_soc::script::queue(&mut m.soc, keys.trim()) {
+        eprintln!("FM1_BENCH_KEYS: {k:?} not understood, left out");
+    }
     true
 }
 
@@ -838,8 +840,8 @@ options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--fl
          [--flaky-core1 RATE [--seed N]] [--version] [--help]
 headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
           --shot MS    run MS ms, then write the panel to work/panel.ppm
-env: FM1_BENCH_KEYS='T[-T2]:PLAY,T:n7,T:enc0:+3,T:pot:512,T:ms:mHEX'  scripted input (--bench, --shot;
-                         times in ms, mHEX: MIDI bytes into the DIN jack)
+env: FM1_BENCH_KEYS='T:PLAY,T:PLAY^,T:n7@100,T:e0:+3,T:pot:512,T:mHEX'  scripted input (--bench,
+                         --shot; times in ms, ^: release, @VEL: velocity, mHEX: MIDI bytes into the DIN jack)
      FM1_BENCH_WAV=FILE    --bench: the audio (44.1 kHz stereo s16le, no header)
      FM1_BENCH_PANEL=FILE  --bench: the panel at the end (PPM)
      FM1_DUMPRAM=FILE      --bench, --shot: the 1 MiB of RAM at the end
