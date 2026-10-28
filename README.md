@@ -327,7 +327,11 @@ The emulator is MIT (`LICENSE`). The firmwares are their authors' and are not pa
 repository; the page fetches them from the authors' sites. `fm1-sid/` (its own repository) has
 files under other licences, among them its player firmware, GPL-3.0 since it is built on
 Felucca's code: its LICENSING.md lists them. The plugin (`crates/fm1-plugin`) is MIT too; the libraries and SDKs it
-builds with are MIT, ISC or Apache-2.0.
+builds with are permissive: MIT, ISC, Apache-2.0, BSD, Zlib, BSL-1.0, Unicode-3.0 and Unlicense, egui's built-in
+fonts OFL-1.1 and the Ubuntu font licence, and Steinberg's VST3 SDK (3.8, through clap-wrapper) MIT. nih-plug is built
+without its VST3 bindings, which are GPL. What the emulator emulates it learned from the chips' behaviour, the
+community's reverse engineering and the firmwares' own sources as references; no GPL code is in this repository
+(the test probe `probes/x0x/d909.c` builds X0X's GPL drum against it from a checkout outside it).
 
 ## Credits
 

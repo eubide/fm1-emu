@@ -33,7 +33,7 @@
 //! raises no IRQ line, so a driver that polls them (Felucca's usb.c) enumerates, and one that
 //! waits for the interrupt (M-VAVE's own firmware) does not.
 //!
-//! SPDX-License-Identifier: GPL-3.0-only
+//! SPDX-License-Identifier: MIT
 
 use std::collections::VecDeque;
 
