@@ -695,12 +695,18 @@ impl Soc {
     fn spi1_write(&mut self, addr: u32, value: u32) {
         match addr {
             0x11d00 => {
-                // CON: bit14 clears the pending transfer-done (and its IRQ 16)
+                // CON: bit14 clears the pending transfer-done (and its IRQ 16), bit13 enables
+                // the IRQ. The FM-1's stock LCD driver disables it before a transfer's interrupt
+                // is due; taken anyway, the interrupt finds its handler idle, which returns
+                // without clearing it, again and again.
                 if value & 0x4000 != 0 {
                     self.periph.spi1_pending = false;
                 }
-                let stored = self.sfr_get(addr);
-                self.sfr_set(addr, (stored & !0x4000) | (value & !0x4000));
+                if value & 0x2000 == 0 {
+                    self.periph.spi1_irq_off();
+                }
+                // (bit 15, done, is the read's; bit 14 only acts)
+                self.sfr_set(addr, value & !0xc000);
             }
             0x11d04 => self.sfr_set(addr, value), // BAUD
             0x11d08 => {
@@ -1416,6 +1422,62 @@ mod tests {
         assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the erase after the cut never happened");
         assert_eq!(soc.flash.ops, 3);
         assert!(soc.flash.cut());
+    }
+
+    /// A chip with IRQ 16 enabled in cpu0's bank and SPI1 at the LCD's BAUD.
+    fn spi1_soc(board: Board) -> Soc {
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        soc.set_board(board);
+        soc.periph.icfg[(periph::IRQ_SPI1 >> 3) as usize] |= 1 << ((periph::IRQ_SPI1 & 7) * 4);
+        soc.write32(0x11d04, 3);
+        soc
+    }
+
+    #[test]
+    fn spi1_interrupt_comes_after_the_bytes_time_on_the_wire() {
+        let mut soc = spi1_soc(Board::Fm1);
+        soc.write32(0x11d00, 0xa021);
+        soc.write32(0x11d0c, RAM_BASE);
+        soc.write32(0x11d10, 0x800);
+        soc.advance(1_000);
+        assert_eq!(soc.periph.pending_irq(), None, "still on the wire");
+        soc.advance(1_000_000);
+        assert_eq!(soc.periph.pending_irq().map(|(n, _)| n), Some(periph::IRQ_SPI1));
+    }
+
+    #[test]
+    fn spi1_con_clears_its_interrupt_enable() {
+        let mut soc = spi1_soc(Board::Fm1);
+        soc.write32(0x11d00, 0xe021);
+        assert_ne!(soc.read32(0x11d00) & 0x2000, 0);
+        soc.write32(0x11d00, 0xc021);
+        assert_eq!(soc.read32(0x11d00) & 0x2000, 0);
+    }
+
+    #[test]
+    fn spi1_interrupt_disabled_before_it_is_due_never_comes() {
+        // the stock LCD driver (FM-1 V16) after a held key: a DMA started with the interrupt
+        // enabled, then acknowledged with the interrupt disabled before its bytes are out
+        let mut soc = spi1_soc(Board::Fm1);
+        soc.write32(0x11d00, 0xe021);
+        soc.write32(0x11d0c, RAM_BASE);
+        soc.write32(0x11d10, 0x800);
+        soc.write32(0x11d00, 0xc021);
+        soc.advance(1_000_000);
+        assert_eq!(soc.periph.pending_irq(), None);
+    }
+
+    #[test]
+    fn smk37_spi1_done_bit_is_busy_after_a_read_modify_write() {
+        // a driver that acknowledges with CON |= bit 14 writes back the done bit it read
+        let mut soc = spi1_soc(Board::Smk37);
+        soc.write32(0x11d08, 0x2c);
+        soc.advance(1_000);
+        let con = soc.read32(0x11d00);
+        soc.write32(0x11d00, con | 0x4000);
+        soc.write32(0x11d0c, RAM_BASE);
+        soc.write32(0x11d10, 0x800);
+        assert_eq!(soc.read32(0x11d00) & 0x8000, 0, "the DMA is still on the wire");
     }
 }
 

@@ -1223,6 +1223,12 @@ impl Periph {
         }
     }
 
+    /// CON bit 13 cleared: IRQ 16 neither stays raised nor comes at the transfer's end.
+    pub fn spi1_irq_off(&mut self) {
+        self.spi1_pending = false;
+        self.spi1_irq_at = u64::MAX;
+    }
+
     /// A SPI2 transfer of `bytes` started (with its interrupt enabled when `irq`): it takes
     /// 16 * (baud + 1) peripheral clocks a byte (48 MHz assumed), so the stock firmware's
     /// interrupt-driven column scan runs at a hardware-like pace instead of back to back.
