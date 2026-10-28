@@ -151,9 +151,9 @@ pub struct Ctx {
     synced: u32,
     /// the next tick is due: leave after this instruction
     brk: u32,
-    /// left inside an if-else block's then-part: its skip (then end, else end), for `run` to
-    /// put in `Cpu::pred_skips` as the interpreter has it there (0: none)
-    pred: [u32; 2],
+    /// left inside an if-else block's then-part: its skip (then end, else end, then start), for
+    /// `run` to put in `Cpu::pred_skips` as the interpreter has it there (0: none)
+    pred: [u32; 3],
 }
 
 /// Run compiled code: returns the instructions executed; cpu.pc is set. At most `cap`
@@ -164,15 +164,15 @@ pub struct Ctx {
 pub(crate) unsafe fn run<B: Bus>(f: u32, start: u32, cpu: &mut Cpu, bus: &mut B, extra: u32, cap: u32) -> u32 {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, pred: [0; 2] };
+    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, pred: [0; 3] };
     // SAFETY: on wasm32 a function pointer is its index in the function table, where the host
     // installed this block's `run` with exactly this signature
     let code: extern "C" fn(*mut Cpu, *mut Ctx, u32, u32) -> u32 = unsafe { std::mem::transmute(f as usize) };
     let k = code(cpu as *mut Cpu, &mut ctx, limit, start);
     if ctx.pred[0] != 0 {
-        let (te, ee) = (ctx.pred[0], ctx.pred[1]);
-        cpu.pred_skips.retain(|&(t, _)| t != te);
-        cpu.pred_skips.push((te, ee));
+        let (te, ee, ts) = (ctx.pred[0], ctx.pred[1], ctx.pred[2]);
+        cpu.pred_skips.retain(|&(t, _, _)| t != te);
+        cpu.pred_skips.push((te, ee, ts));
     }
     if k > 0 {
         // the ticks of the instructions run, less those the helpers applied already
@@ -385,8 +385,8 @@ struct Gen<'a> {
     /// the same as a table in memory for jumps to a pc known only at run time (`jump_local`):
     /// its address and mask; (pc, index) pairs at ((pc >> 1) & mask) * 8, collision-free
     table: Option<(u32, u32)>,
-    /// emitting an if-else block's then-part: its skip (then end, else end)
-    pred: Option<(u32, u32)>,
+    /// emitting an if-else block's then-part: its skip (then end, else end, then start)
+    pred: Option<(u32, u32, u32)>,
     /// the block being emitted, the region's size, and the `if`s open inside the block's code
     cur: u32,
     n: u32,
@@ -543,14 +543,17 @@ impl Gen<'_> {
         match self.pred {
             // inside an if-else block's then-part: at its end the skip is taken (as `finish`),
             // before it the skip goes with the exit (`run` puts it in pred_skips)
-            Some((te, ee)) if next_pc == te => self.exit_imm(ee, count),
-            Some((te, ee)) => {
+            Some((te, ee, _)) if next_pc == te => self.exit_imm(ee, count),
+            Some((te, ee, ts)) => {
                 self.get(L_CTX);
                 self.i32c(te);
                 self.mem_op(I32_STORE, 2, OFF_PRED);
                 self.get(L_CTX);
                 self.i32c(ee);
                 self.mem_op(I32_STORE, 2, OFF_PRED + 4);
+                self.get(L_CTX);
+                self.i32c(ts);
+                self.mem_op(I32_STORE, 2, OFF_PRED + 8);
                 self.exit_imm(next_pc, count);
             }
             None => self.exit_imm(next_pc, count),
@@ -1294,7 +1297,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                     ended = true;
                     break;
                 }
-                g.pred = Some((then_end, else_end));
+                g.pred = Some((then_end, else_end, next_pc));
                 pc = next_pc;
                 continue;
             }
@@ -1387,7 +1390,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
             g.check_brk(next_pc, count, op.glue);
         }
         pc = next_pc;
-        if let Some((te, ee)) = g.pred.filter(|&(te, _)| next_pc == te) {
+        if let Some((te, ee, _)) = g.pred.filter(|&(te, _, _)| next_pc == te) {
             // the then-part's end: past the else part
             let _ = te;
             g.pred = None;
