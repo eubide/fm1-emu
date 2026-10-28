@@ -559,6 +559,7 @@ impl Cpu {
 
     /// `run_fast`'s loop; `STRETCH`: `stop_pc` is set (`run_stretch`).
     #[inline(always)]
+    #[allow(unused_assignments)] // `sync!` right before a return leaves `synced` unread
     fn run_fast_in<B: Bus, const STRETCH: bool>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
         if trace_on() {
             return Ok((0, false));
