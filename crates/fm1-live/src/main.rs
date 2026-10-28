@@ -18,8 +18,8 @@
 //! GLO HOME SAVE ARP SEQ, Left/Right = SELECT, Up/Down = PRESETS,
 //! , / . = ALGORITHM, Esc quits.
 //!
-//! MIDI: every MIDI input of this computer plays the synth through its MIDI IN jack
-//! (`--midi none` turns that off, `--midi NAME` takes the inputs whose name contains NAME);
+//! MIDI: every MIDI input of this computer plays the synth through its MIDI IN jack, plugged
+//! in before the start or after (`--midi none` turns that off, `--midi NAME` takes the inputs whose name contains NAME);
 //! `--midi-ch N` sends channel messages to channel N (M-VAVE's firmware listens on 2).
 //!
 //! USB (`--usb`): a cable to this computer (fm1_soc::usb): the emulated FM-1 enumerates, and a
@@ -40,6 +40,7 @@ use panel::{Ctl, ENCS, H, W};
 
 #[path = "../../fm1-emu/src/buildinfo.rs"]
 mod buildinfo;
+mod midi_in;
 mod panel;
 mod panel_smk;
 use std::collections::VecDeque;
@@ -680,7 +681,7 @@ impl UsbPorts {
         for ev in m.soc.usb.events.drain(..) {
             match ev {
                 fm1_soc::usb::UsbEvent::Configured { product, vid, pid } => {
-                    let name = format!("{product} (emu)");
+                    let name = format!("{product}{}", midi_in::EMU_SUFFIX);
                     self.open(&name, tx);
                     let ok = self.out.is_some() && self._inp.is_some();
                     eprintln!("USB: \"{product}\" ({vid:04x}:{pid:04x}) on the bus{}", if ok { format!(", MIDI device \"{name}\"") } else { ", no MIDI device (virtual ports failed)".into() });
@@ -788,48 +789,6 @@ fn button(k: Key) -> Option<u8> {
     })
 }
 
-/// Connect the MIDI inputs `--midi` asks for: their bytes go to the MIDI IN jack. The
-/// connections live as long as the returned value.
-fn midi_inputs(o: &Opts, tx: &mpsc::Sender<Action>) -> Vec<midir::MidiInputConnection<()>> {
-    let mut conns = Vec::new();
-    if o.midi == "none" {
-        return conns;
-    }
-    let probe = match midir::MidiInput::new("fm1-live") {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("MIDI in: {e}");
-            return conns;
-        }
-    };
-    for port in probe.ports() {
-        let Ok(name) = probe.port_name(&port) else { continue };
-        if o.midi != "all" && !name.to_lowercase().contains(&o.midi.to_lowercase()) {
-            continue;
-        }
-        let Ok(mut input) = midir::MidiInput::new("fm1-live") else { continue };
-        input.ignore(midir::Ignore::None);
-        let (tx, ch) = (tx.clone(), o.midi_ch);
-        let got = input.connect(&port, "fm1-live in", move |_, msg, _| {
-            for (i, &b) in msg.iter().enumerate() {
-                let b = if i == 0 && ch != 0 && (0x80..0xf0).contains(&b) { (b & 0xf0) | (ch - 1) } else { b };
-                let _ = tx.send(Action::Midi { b });
-            }
-        }, ());
-        match got {
-            Ok(c) => {
-                eprintln!("MIDI in: {name}");
-                conns.push(c);
-            }
-            Err(e) => eprintln!("MIDI in: {name}: {e}"),
-        }
-    }
-    if conns.is_empty() {
-        eprintln!("MIDI in: no inputs{}", if o.midi == "all" { String::new() } else { format!(" matching {:?}", o.midi) });
-    }
-    conns
-}
-
 /// Pixels of vertical mouse drag per encoder click.
 const DRAG_PER_CLICK: f32 = 12.0;
 
@@ -912,7 +871,19 @@ fn main() {
     let status = Arc::new(Mutex::new(String::from("booting")));
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Action>();
-    let _midi = midi_inputs(&o, &tx);
+    if o.midi != "none" {
+        let mut ins = midi_in::MidiIns::new(&o.midi, o.midi_ch, tx.clone());
+        if let Err(e) = ins.refresh() {
+            eprintln!("MIDI in: {e}");
+        }
+        if ins.is_empty() {
+            eprintln!("MIDI in: no inputs{} yet", if o.midi == "all" { String::new() } else { format!(" matching {:?}", o.midi) });
+        }
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = ins.refresh();
+        });
+    }
     let (usb_tx, usb_rx) = mpsc::channel::<Vec<u8>>();
     let usb_on = o.usb;
 
