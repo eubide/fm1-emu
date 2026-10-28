@@ -28,6 +28,7 @@ use fm1_core::Bus;
 pub mod script;
 pub mod flaky;
 pub mod fwsc;
+pub mod irqstorm;
 mod lcd;
 pub mod machine;
 pub mod p33;
@@ -236,6 +237,8 @@ pub struct Soc {
     lock_owner: Option<u32>,
     /// FM1_GPIO_TRACE: GPIO register writes by address (debugging port use).
     pub gpio_writes: Option<std::collections::BTreeMap<u32, u64>>,
+    /// FM1_IRQ_STORM: warn when an interrupt is taken again and again, never cleared.
+    pub irq_storm: Option<irqstorm::IrqStorm>,
     unknown_log: Vec<UnknownAccess>,
     /// `--flaky-core1`: core 1's RAM loads misread now and then (flaky.rs); None = a good unit.
     pub flaky_core1: Option<flaky::FlakyCore1>,
@@ -394,6 +397,7 @@ impl Soc {
             sfc_unenc: (0, 0),
             sfc_from_flash: Vec::new(),
             gpio_writes: std::env::var("FM1_GPIO_TRACE").ok().map(|_| Default::default()),
+            irq_storm: irqstorm::IrqStorm::from_env(),
             unknown_log: Vec::new(),
             flaky_core1: None,
             p33: Default::default(),

@@ -500,6 +500,7 @@ pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool)
     let mut done = 0u32;
     let mut ticked = std::mem::take(pending_tick);
     while done < n {
+        storm_seen(soc, 0);
         if ticked || soc.periph.tick() {
             soc.advance(0);
         }
@@ -514,6 +515,7 @@ pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool)
                 if cpu.irq_ready(prio) {
                     let handler = soc.read32(VEC_BASE + 4 * irq as u32);
                     cpu.interrupt(handler, prio);
+                    storm_taken(soc, 0, irq, handler);
                     // the handler's first instruction may stay in compiled code (a micro-op now):
                     // TIMER4's idle skip must see "in an ISR" from that instruction on
                     soc.periph.in_isr = true;
@@ -556,6 +558,20 @@ pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool)
     Ok(done)
 }
 
+fn storm_seen(soc: &mut Soc, core: u32) {
+    if let Some(w) = &mut soc.irq_storm {
+        w.seen(core, |irq| soc.periph.irq_pending_for(core, irq));
+    }
+}
+
+fn storm_taken(soc: &mut Soc, core: u32, irq: u8, handler: u32) {
+    if let Some(w) = &mut soc.irq_storm {
+        if let Some(msg) = w.taken(core, irq, handler, soc.periph.ms()) {
+            eprintln!("{msg}");
+        }
+    }
+}
+
 /// cpu1 once cpu0 released it (`0x10008 |= 8`): its entry is the word at 0x01C7FFF8 (the
 /// stock firmware's stub at 0x020001B8 and X0X's entry both put it there; older images
 /// without it: the RAM job loop at 0x01C022B6). It starts in supervisor mode.
@@ -593,6 +609,7 @@ pub fn run_cpu1(c1: &mut Cpu, soc: &mut Soc, cycles: u64) -> Result<(), String> 
             if c1.irq_ready(prio) {
                 let handler = soc.read32(VEC_BASE + 4 * irq as u32);
                 c1.interrupt(handler, prio);
+                storm_taken(soc, 1, irq, handler);
             }
         }
         // Probing with nothing pending for core 1, the calls below (a block each) run back to
@@ -629,6 +646,7 @@ pub fn run_cpu1(c1: &mut Cpu, soc: &mut Soc, cycles: u64) -> Result<(), String> 
         };
         left = left.saturating_sub(k);
         probing = probing.saturating_sub(k);
+        storm_seen(soc, 1);
         if soc.reset_due() {
             break; // (cpu1 wrote PR_PWR: `Core1Bus::stop_at_reset`)
         }

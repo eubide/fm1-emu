@@ -781,53 +781,68 @@ impl Periph {
 
     /// The same for core `core` (its own enable bank).
     pub fn pending_irq_for(&self, core: u32) -> Option<(u8, u8)> {
-        let bank = if core == 0 { &self.icfg } else { &self.icfg1 };
-        let icfg = |n: u8| bank[(n >> 3) as usize];
         if !self.any_pending() {
             return None;
         }
         let mut best: Option<(u8, u8)> = None;
-        let mut consider = |n: u8| {
-            let nib = (icfg(n) >> ((n & 7) * 4)) & 0xf;
-            if nib & 1 != 0 {
-                let prio = ((nib >> 1) & 7) as u8;
+        self.each_pending(|n| {
+            if let Some(prio) = self.irq_enabled(core, n) {
                 if best.map_or(true, |(_, p)| prio > p) {
                     best = Some((n, prio));
                 }
             }
-        };
+        });
+        best
+    }
+
+    /// Core `core` has `irq` enabled and it is pending, whether or not another one outranks it.
+    pub fn irq_pending_for(&self, core: u32, irq: u8) -> bool {
+        let mut found = false;
+        if self.irq_enabled(core, irq).is_some() {
+            self.each_pending(|n| found |= n == irq);
+        }
+        found
+    }
+
+    /// `irq`'s priority when core `core` has it enabled.
+    fn irq_enabled(&self, core: u32, irq: u8) -> Option<u8> {
+        let bank = if core == 0 { &self.icfg } else { &self.icfg1 };
+        let nib = (bank[(irq >> 3) as usize] >> ((irq & 7) * 4)) & 0xf;
+        (nib & 1 != 0).then_some(((nib >> 1) & 7) as u8)
+    }
+
+    fn each_pending(&self, mut f: impl FnMut(u8)) {
         if self.t5_pending {
-            consider(IRQ_TIMER5);
+            f(IRQ_TIMER5);
         }
         if self.tick_pending {
-            consider(IRQ_OS_TICK);
+            f(IRQ_OS_TICK);
         }
         if self.spi1.pending {
-            consider(IRQ_SPI1);
+            f(IRQ_SPI1);
         }
         if self.adc_irq {
-            consider(IRQ_SARADC);
+            f(IRQ_SARADC);
         }
         if self.spi2_pending {
-            consider(IRQ_SPI2);
+            f(IRQ_SPI2);
         }
         if self.uart_irq {
-            consider(IRQ_UART1);
+            f(IRQ_UART1);
         }
         for i in 0..4 {
             if self.tmr[i].pending {
-                consider(4 + i as u8);
+                f(4 + i as u8);
             }
         }
         if self.alnk_pend & 0xf0 != 0 && self.alnk_con0 & 0x800 != 0 {
-            consider(IRQ_ALNK0);
+            f(IRQ_ALNK0);
         }
         for b in 0..8u8 {
             if self.ilat & (1 << b) != 0 {
-                consider(120 + b);
+                f(120 + b);
             }
         }
-        best
     }
 
     // ---- registers ------------------------------------------------------
