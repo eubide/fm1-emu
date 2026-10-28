@@ -657,6 +657,7 @@ impl Cpu {
                         }
                         // (inside a construct: this prefix and no further, so no chaining on)
                         let cap = if inside { (limit - n).min(insns) } else if open { budget - n } else { limit - n };
+                        let entry = pc;
                         // SAFETY: code was compiled for this bus type and memory map
                         let (k, slot, stop) = unsafe { jit::run(code, self, bus, &mem, extra, cap, inside) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
@@ -686,7 +687,7 @@ impl Cpu {
                             if inside && !self.pred_skips.is_empty() {
                                 // (the then-part's rule for where its last instruction went; after
                                 // the link: the slot goes to where the code left, not past a skip)
-                                pc = self.finish_inside();
+                                pc = self.finish_inside(entry);
                                 if self.pred_skips.is_empty() && bus.irq_pending() {
                                     self.insn_count += (n - synced) as u64;
                                     return Ok((n, false));
@@ -839,13 +840,14 @@ impl Cpu {
     /// careful path then stops if that ended the construct and an interrupt is pending.
     #[cfg(native_jit)]
     #[inline(never)]
-    fn finish_inside(&mut self) -> u32 {
+    fn finish_inside(&mut self, entry: u32) -> u32 {
         let pc = self.pc;
         if let Some(i) = self.pred_skips.iter().position(|&(te, _)| te == pc) {
             self.pc = self.pred_skips.remove(i).1;
         }
         let pc = self.pc;
-        self.pred_skips.retain(|&(te, _)| pc <= te);
+        // (as `finish`: out past the then-part, or back before where the prefix began)
+        self.pred_skips.retain(|&(te, _)| pc <= te && pc >= entry);
         pc
     }
 
@@ -889,11 +891,15 @@ impl Cpu {
         // (not a glued head: the careful path runs it as the pair it is)
         if gated && !op.careful && !op.pair_head && self.pred_skips.len() == 1 && self.pair_pending.is_none() && self.rep_end == 0 && self.hold_irq == 0 {
             // `finish` for one pending skip and nothing else in progress
+            let at = self.pc;
             let mut pc = self.exec_fast(bus, op.fast, next_pc).unwrap_or(next_pc);
             self.insn_count += 1;
             let (te, ee) = self.pred_skips[0];
             let mut still = true;
-            if pc >= te {
+            if pc < at {
+                self.pred_skips.clear(); // back out of the construct (`finish`)
+                still = false;
+            } else if pc >= te {
                 if pc == te {
                     pc = ee;
                 }
@@ -3341,6 +3347,7 @@ impl Cpu {
     fn finish(&mut self, jumped: Option<u32>, next_pc: u32) {
         self.insn_count += 1;
         self.hold_irq = 0;
+        let at = self.pc;
         self.pc = jumped.unwrap_or(next_pc);
         if !self.pred_skips.is_empty() {
             let pc = self.pc;
@@ -3349,8 +3356,9 @@ impl Cpu {
                 self.pc = ee;
             }
             let pc = self.pc;
-            // a branch out of the construct abandons its pending skip
-            self.pred_skips.retain(|&(te, _)| pc <= te);
+            // a branch out of the construct abandons its pending skip: past its then-part, or
+            // back before this instruction (clang's tail call `if (c) { goto f } else { .. }`)
+            self.pred_skips.retain(|&(te, _)| pc <= te && pc >= at);
         }
         if self.rep_end != 0 && jumped.is_none() && self.pc == self.rep_end {
             // fell off the end of a rep block: count down, loop or finish
@@ -4816,6 +4824,59 @@ mod tests {
             }
             assert_eq!(cpu.regs[..6], want, "r13 = {r13:#x}");
         }
+    }
+
+    #[test]
+    fn a_goto_back_out_of_a_then_part_ends_the_construct() {
+        // clang's tail call from fm1-dock (h_c1_wait): `b0 e8 00 10` if (r0 != 0) { `ff ea ..`
+        // goto f } else { `40 20` r0 = 0 }, f before it. The goto leaves the construct: its
+        // pending skip (and the interrupts it holds back) must not follow it into f, where an
+        // audio ISR waited ~0.7 ms for the other core with TIMER5 held off.
+        let mut mem = vec![0u8; 0x100];
+        mem[0x10..0x12].copy_from_slice(&[0xc5, 0x21]); // f: r5 += 1
+        mem[0x12..0x14].copy_from_slice(&[0xc5, 0x21]);
+        mem[0x80..0x84].copy_from_slice(&[0xb0, 0xe8, 0x00, 0x10]);
+        let off = ((0x10i32 - 0x88) / 2) as i16 as u16;
+        mem[0x84..0x88].copy_from_slice(&[0xff, 0xea, off as u8, (off >> 8) as u8]);
+        mem[0x88..0x8a].copy_from_slice(&[0x40, 0x20]);
+        for fast in [false, true] {
+            let mut ram = FlatRam::new(mem.clone());
+            let mut cpu = Cpu::new(0x80);
+            cpu.regs[0] = 1;
+            cpu.ie = true;
+            cpu.sreg_store[0] |= 0x100;
+            cpu.step(&mut ram).unwrap();
+            assert!(!cpu.pred_skips.is_empty(), "in the then-part");
+            assert!(!cpu.irq_ready(4), "no interrupt inside the construct");
+            if fast {
+                // (as run_blocks: a step where run_fast runs nothing)
+                for _ in 0..16 {
+                    if cpu.pc == 0x12 {
+                        break;
+                    }
+                    if cpu.run_fast(&mut ram, 1).unwrap().0 == 0 {
+                        cpu.step(&mut ram).unwrap();
+                    }
+                }
+                assert_eq!(cpu.pc, 0x12, "into f, one instruction of it run");
+            } else {
+                cpu.step(&mut ram).unwrap();
+                assert_eq!(cpu.pc, 0x10, "the goto");
+                cpu.step(&mut ram).unwrap();
+            }
+            assert!(cpu.pred_skips.is_empty(), "fast {fast}: the goto left the construct");
+            assert!(cpu.irq_ready(4), "fast {fast}: interrupts again in f");
+            assert_eq!(cpu.regs[5], 1, "fast {fast}");
+        }
+        // r0 == 0: the else part, then on past the construct
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0x80);
+        cpu.regs[0] = 0;
+        cpu.regs[3] = 7;
+        cpu.step(&mut ram).unwrap();
+        cpu.step(&mut ram).unwrap();
+        assert_eq!((cpu.pc, cpu.regs[0]), (0x8a, 0));
+        assert!(cpu.pred_skips.is_empty());
     }
 
     #[test]
