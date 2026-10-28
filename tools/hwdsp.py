@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""The AC79's FFT / vector unit (JL_FFT, crates/fm1-soc/src/hwdsp.rs) and its EQ (JL_EQ) measured: a plan
-of jobs run by fm1-dock's probes/hwdsp.c and probes/hweq.c on an FM-1 and in fm1-emu, the results kept as
-the emulator's reference.
+"""The AC79's FFT / vector unit (JL_FFT, crates/fm1-soc/src/hwdsp.rs), its EQ (JL_EQ, hweq.rs) and its
+sample-rate converter (JL_SRC, hwsrc.rs) measured: a plan of jobs run by fm1-dock's probes/hwdsp.c,
+hweq.c and hwsrc.c on an FM-1 and in fm1-emu, the results kept as the emulator's reference.
 
-  tools/hwdsp.py run --on emu|fm1 [--plan fft|vec|eq|all] [--only SUBSTR] [--dock DIR] [--port NAME]
+  tools/hwdsp.py run --on emu|fm1 [--plan fft|vec|eq|src|all] [--only SUBSTR] [--dock DIR] [--port NAME]
       runs the plan's cases (one probe run each) and merges what came back into tests/hwdsp/ON.json
   tools/hwdsp.py compare [A B]      case by case, where two result files differ (default emu fm1)
   tools/hwdsp.py fit [ON]           each FFT case against the exact transform (numpy): the scale
                                     that fits best, the error left after it, saturation
+  tools/hwdsp.py srcfit             crates/fm1-soc/src/hwsrc_kernel.rs: the SRC's kernel at 256 phases, least
+                                    squares over tests/hwdsp/fm1.json's mono src/ cases, anchored to the
+                                    kernel an impulse upsampled x512 shows (numpy, scipy)
   tools/hwdsp.py export [ON]        tests/hwdsp/ON.txt: a line a case, `id | args | ticks | con | out`
                                     (hex words): what crates/fm1-soc/tests/hwdsp_fm1.rs checks the model by
 
@@ -300,6 +303,56 @@ def plan_eq():
     return c
 
 
+# ---- the sample-rate converter ---------------------------------------------------------------
+
+def srcjob(in_rate, out_rate, nin, nout, ch=1, inter=0, calls=1, gen=RANDOM, amp=8000, seed=7, phase=0, offset=0,
+           out_n=None, out_off=0):
+    """probes/hwsrc.c's argument"""
+    return [1, ch | inter << 8 | calls << 12, in_rate, out_rate, nin, nout, gen, amp, seed, phase, offset,
+            out_n or min(3000, nout * ch), out_off]
+
+
+def plan_src():
+    c = [("src/regs", [0])]
+    # the kernel: an impulse upsampled finely
+    c += [("src/kernel_up64", srcjob(1, 64, 40, 2600, gen=IMPULSE, amp=10000, seed=2)),
+          ("src/kernel_up128", srcjob(1, 128, 22, 2900, gen=IMPULSE, amp=10000, seed=1)),
+          ("src/kernel_up100", srcjob(3, 300, 28, 2900, gen=IMPULSE, amp=10000, seed=1)),
+          ("src/kernel_up64_neg", srcjob(1, 64, 40, 2600, gen=IMPULSE, amp=-32768 & 0xFFFFFFFF, seed=2)),
+          ("src/impulse_1to1", srcjob(48000, 48000, 64, 80, gen=IMPULSE, amp=10000, seed=20)),
+          ("src/k64_full", srcjob(1, 64, 30, 1920, gen=IMPULSE, amp=32767, seed=1, out_n=1920))]
+    # the kernel at 512 phases, full scale, in windows of 3000 samples
+    c += [(f"src/k512@{o}", srcjob(1, 512, 28, 14336, gen=IMPULSE, amp=32767, seed=1, out_n=3000, out_off=o))
+          for o in range(0, 14336, 3000)]
+    for a, b in ((48000, 48000), (44100, 48000), (48000, 44100), (8000, 48000), (48000, 8000), (22050, 44100),
+                 (16000, 44100), (44100, 16000), (32000, 48000), (48000, 32000), (11025, 12000)):
+        c.append((f"src/rate/{a}_{b}", srcjob(a, b, 600, 2900)))
+    c += [
+        ("src/sat", srcjob(44100, 48000, 600, 700, gen=RAW, amp=0, seed=5)),
+        ("src/ramp", srcjob(44100, 48000, 600, 700, gen=RAMP, amp=50, seed=-15000 & 0xFFFFFFFF)),
+        ("src/stereo_inter", srcjob(44100, 48000, 300, 340, ch=2, inter=1)),
+        ("src/stereo_block", srcjob(44100, 48000, 300, 340, ch=2)),
+        ("src/ch4_inter", srcjob(16000, 48000, 120, 380, ch=4, inter=1)),
+        ("src/ch8_inter", srcjob(16000, 48000, 60, 190, ch=8, inter=1)),
+        ("src/calls3", srcjob(44100, 48000, 600, 700, calls=3)),
+        ("src/calls3_down", srcjob(48000, 44100, 600, 600, calls=3)),
+        ("src/out_full", srcjob(8000, 48000, 300, 500)),
+        ("src/in_short", srcjob(48000, 8000, 30, 500)),
+        ("src/phase0x8000", srcjob(44100, 48000, 300, 400, phase=0x8000)),
+        ("src/phase0x1ffff", srcjob(44100, 48000, 300, 400, phase=0x1FFFF)),
+        ("src/offset5", srcjob(44100, 48000, 300, 400, offset=5)),
+        ("src/long", srcjob(44100, 48000, 2700, 2950)),
+    ]
+    return c
+
+
+def halfwords(r, key="out"):
+    """a byte record (p_bytes) as int16s"""
+    v = r.get("result", {}).get(key, "")
+    b = bytes.fromhex(v.replace(" ", "")) if isinstance(v, str) else bytes(v)
+    return list(struct.unpack(f"<{len(b) // 2}h", b))
+
+
 def plan(name):
     if name == "fft":
         return plan_fft()
@@ -309,7 +362,9 @@ def plan(name):
         return plan_vec()
     if name == "eq":
         return plan_eq()
-    return [("regs", [0])] + plan_fft() + plan_vec() + plan_eq()
+    if name == "src":
+        return plan_src()
+    return [("regs", [0])] + plan_fft() + plan_vec() + plan_eq() + plan_src()
 
 
 def load(on):
@@ -323,7 +378,7 @@ def cmd_run(a):
     os.environ.setdefault("FM1_LIVE", str(ROOT / "target" / "release" / "fm1-live"))
     import probe  # fm1-dock's tools/probe.py
     blobs = {}
-    for name in ("hwdsp", "hweq"):
+    for name in ("hwdsp", "hweq", "hwsrc"):
         for _ in range(5):                      # (the Docker build is flaky on macOS: try again)
             try:
                 blobs[name] = probe.build(dock / "probes" / f"{name}.c")
@@ -339,7 +394,7 @@ def cmd_run(a):
         if cid in res and not a.again:
             continue
         arg = b"".join(struct.pack("<I", int(x) & 0xFFFFFFFF) for x in args)
-        blob = blobs["hweq" if cid.startswith("eq/") else "hwdsp"]
+        blob = blobs["hweq" if cid.startswith("eq/") else "hwsrc" if cid.startswith("src/") else "hwdsp"]
         r = probe.run_emu(blob, arg, a.ms) if a.on == "emu" else probe.run_fm1(blob, arg, a.ms, a.port)
         r = {"args": args, **{k2: v for k2, v in r.items() if k2 in ("state", "rc", "result", "crash_pc")}}
         res[cid] = r
@@ -409,15 +464,86 @@ def cmd_fit(a):
               f"ticks {r['result'].get('ticks')}  sat {sat}")
 
 
+def cmd_srcfit(a):
+    """the SRC's 24-tap kernel h(t), t = i / 256 input samples after the newest, as crates/fm1-soc/src/hwsrc.rs
+    uses it: each output of a mono case is sum_t hist[t] h(t + phase / out rate), rounded (the phase walk
+    as hwsrc.rs has it), so a linear equation in the table's knots (linear interpolation between them);
+    the x512 impulse (32767 h) anchors every knot"""
+    import numpy as np
+    from scipy.sparse import lil_matrix, vstack
+    from scipy.sparse.linalg import lsqr
+    R = load("fm1")
+    K = np.concatenate([np.array(halfwords(R[f"src/k512@{o}"]), float) for o in range(0, 14336, 3000)])[:14336]
+    K = K[np.nonzero(K)[0][0]:][:24 * 512]
+    P, n = 256, 24 * 256 + 1
+    rows, ys = [], []
+    for cid in sorted(R):
+        if not (cid.startswith("src/rate/") or cid in ("src/ramp", "src/long", "src/phase0x8000", "src/kernel_up100",
+                                                       "src/out_full", "src/in_short", "src/calls3", "src/calls3_down",
+                                                       "src/sat", "src/offset5")):
+            continue
+        r = R[cid]
+        args = r["args"]
+        x = [((v & 0xFFFF) ^ 0x8000) - 0x8000 for v in gen(args[6], args[7], args[8], args[4])]
+        inr, outr, p = args[2], args[3], args[9]
+        hw = halfwords(r)[:args[5] - int(r["result"]["olen"][-1], 16)]
+        hist, i = [0] * 24, 0
+        for y in hw:
+            while p >= outr and i < len(x):
+                hist = [x[i]] + hist[:-1]
+                i += 1
+                p -= outr
+            if abs(y) < 32767:
+                rows.append([(t + p / outr, hist[t]) for t in range(24) if hist[t]])
+                ys.append(y)
+            p += inr
+    A = lil_matrix((len(rows), n))
+    for k, terms in enumerate(rows):
+        for u, xv in terms:
+            q = u * P
+            j = int(np.floor(q))
+            w = q - j
+            if j < n:
+                A[k, j] += xv * (1 - w)
+            if j + 1 < n:
+                A[k, j + 1] += xv * w
+    W = 0.5
+    An = lil_matrix((n, n))
+    bn = np.zeros(n)
+    for j in range(n):
+        if 2 * j < len(K):
+            An[j, j] = W * 32767
+            bn[j] = W * K[2 * j]
+    T = lsqr(vstack([A.tocsr(), An.tocsr()]), np.concatenate([ys, bn]), atol=1e-12, btol=1e-12, iter_lim=50000)[0]
+    q = np.round(T * 2 ** 30).astype(np.int64)
+    lines = ["//! The AC79 sample-rate converter's kernel (hwsrc.rs): 24 taps x 256 phases + 1, Q30, h(t) at t = i / 256",
+             "//! input samples after the newest. Fitted (least squares, anchored to the kernel an impulse upsampled",
+             "//! x512 shows) to what an FM-1 returned for tests/hwdsp/fm1.txt's src/ cases; tools/hwdsp.py srcfit",
+             "//! makes it, do not edit.",
+             f"pub static KERNEL: [i32; {len(q)}] = ["]
+    for k in range(0, len(q), 12):
+        lines.append("    " + " ".join(f"{v}," for v in q[k:k + 12]))
+    lines.append("];")
+    out = ROOT / "crates" / "fm1-soc" / "src" / "hwsrc_kernel.rs"
+    out.write_text("\n".join(lines) + "\n")
+    print(f"{out}: {len(rows)} equations, peak {T.max():.6f}")
+
+
 def cmd_export(a):
     R = load(a.on)
     lines = ["# tools/hwdsp.py export: id | args | ticks | CON when done | out (hex words)"]
     for cid in sorted(R):
         r = R[cid]
         res = r.get("result", {})
-        out = " ".join(f"{int(v, 16):08x}" for v in res.get("out", []))
+        o = res.get("out", [])
+        if isinstance(o, str):                  # (a byte record: halfwords, two a word)
+            hw = halfwords(r)
+            hw += [0] * (len(hw) % 2)
+            o = [f"0x{(hw[i] & 0xFFFF) | (hw[i + 1] & 0xFFFF) << 16:08x}" for i in range(0, len(hw), 2)]
+        out = " ".join(f"{int(v, 16):08x}" for v in o)
+        done = res.get("con_done", "")
         lines.append(f"{cid} | {','.join(str(x) for x in r['args'])} | {res.get('ticks', '')} | "
-                     f"{res.get('con_done', '')} | {out}")
+                     f"{' '.join(done) if isinstance(done, list) else done} | {out}")
     (OUT / f"{a.on}.txt").write_text("\n".join(lines) + "\n")
     print(f"{OUT / (a.on + '.txt')}: {len(R)} cases")
 
@@ -427,7 +553,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--on", default="emu", choices=("emu", "fm1"))
-    r.add_argument("--plan", default="all", choices=("all", "fft", "fftfull", "vec", "eq"))
+    r.add_argument("--plan", default="all", choices=("all", "fft", "fftfull", "vec", "eq", "src"))
     r.add_argument("--only", default="")
     r.add_argument("--again", action="store_true", help="run cases already in the file again")
     r.add_argument("--dock", default=str(ROOT.parent / "fm1-harbor"))
@@ -441,8 +567,9 @@ def main():
     f.add_argument("on", nargs="?", default="fm1")
     e = sub.add_parser("export")
     e.add_argument("on", nargs="?", default="fm1")
+    sub.add_parser("srcfit")
     a = ap.parse_args()
-    {"run": cmd_run, "compare": cmd_compare, "fit": cmd_fit, "export": cmd_export}[a.cmd](a)
+    {"run": cmd_run, "compare": cmd_compare, "fit": cmd_fit, "export": cmd_export, "srcfit": cmd_srcfit}[a.cmd](a)
 
 
 if __name__ == "__main__":
