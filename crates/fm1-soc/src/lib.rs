@@ -28,6 +28,7 @@ use fm1_core::Bus;
 pub mod script;
 pub mod flaky;
 pub mod hwdsp;
+pub mod hweq;
 pub mod fwsc;
 pub mod irqstorm;
 mod lcd;
@@ -95,6 +96,8 @@ enum Region {
     Alnk,
     /// JL_FFT, the FFT / vector unit (hwdsp.rs).
     HwDsp,
+    /// JL_EQ and its RAM (hweq.rs).
+    HwEq,
     Sram2,
     Unknown,
 }
@@ -249,6 +252,8 @@ pub struct Soc {
     pub p33: p33::P33,
     /// The FFT / vector unit (JL_FFT, 0x1EE0400; hwdsp.rs).
     pub hwdsp: hwdsp::HwDsp,
+    /// The EQ (JL_EQ, 0x1E000, its RAM at 0x1E800; hweq.rs).
+    pub hweq: hweq::HwEq,
     /// USB0 and, with a cable (`usb_plug`), a host on the other end (usb.rs).
     pub usb: usb::Usb,
     /// Exact skipping of cpu0's polling loops (`machine::run_blocks`).
@@ -407,6 +412,7 @@ impl Soc {
             flaky_core1: None,
             p33: Default::default(),
             hwdsp: Default::default(),
+            hweq: hweq::HwEq::new(),
             usb: Default::default(),
             // (FM1_TRACE: a trace shows every instruction as it runs, not a probe's)
             loop_skip: machine::LoopSkip::new(std::env::var_os("FM1_NO_LOOPSKIP").is_none() && std::env::var_os("FM1_TRACE").is_none()),
@@ -527,7 +533,7 @@ impl Soc {
             // the SMK-37's matrix rows and SPI1 busy follow the clock; its ADC is left alone too
             Region::Gpio | Region::Adc | Region::Spi1 => fm1,
             // (the FFT / vector unit's done bit comes with the clock)
-            Region::Spi0 | Region::Rand | Region::HwDsp | Region::Unknown => false,
+            Region::Spi0 | Region::Rand | Region::HwDsp | Region::HwEq | Region::Unknown => false,
         }
     }
 
@@ -669,6 +675,7 @@ impl Soc {
                 // FM-1's stock firmware touches the block too, as before: unknown.
                 0x16800..=0x16a1f if self.board == Board::Smk37 => Region::Usb,
                 0x20000..=0x2ffff => Region::Bt,
+                hweq::BASE..=hweq::END | hweq::RAM..=hweq::RAM_END => Region::HwEq,
                 _ => Region::Unknown,
             };
         }
@@ -1031,6 +1038,7 @@ impl Soc {
             }
             Region::P33 => self.p33.read(addr),
             Region::HwDsp => self.hwdsp.read(addr, self.periph.cycles),
+            Region::HwEq => self.hweq.read(addr, self.periph.cycles),
             Region::Unknown => {
                 self.log_unknown(addr, 4, false, 0);
                 0
@@ -1194,6 +1202,12 @@ impl Soc {
                 u.write(self, addr, value, cycles);
                 self.hwdsp = u;
             }
+            Region::HwEq => {
+                let mut u = std::mem::take(&mut self.hweq);
+                let cycles = self.periph.cycles;
+                u.write(self, addr, value, cycles);
+                self.hweq = u;
+            }
             Region::Unknown => self.log_unknown(addr, 4, true, value),
         }
     }
@@ -1307,6 +1321,7 @@ mod tests {
             0x11900..=0x119ff => Region::Ana,
             0x13e08..=0x13e0f => Region::P33,
             0x20000..=0x2ffff => Region::Bt,
+            0x1e000..=0x1e01f | 0x1e800..=0x1eb3f => Region::HwEq,
             0x1eee240..=0x1eee24f => Region::Dbg,
             _ => Region::Unknown,
         }

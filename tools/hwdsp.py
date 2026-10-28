@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""The AC79's FFT / vector unit (JL_FFT, crates/fm1-soc/src/hwdsp.rs) measured: a plan of jobs run by
-fm1-dock's probes/hwdsp.c on an FM-1 and in fm1-emu, the results kept as the emulator's reference.
+"""The AC79's FFT / vector unit (JL_FFT, crates/fm1-soc/src/hwdsp.rs) and its EQ (JL_EQ) measured: a plan
+of jobs run by fm1-dock's probes/hwdsp.c and probes/hweq.c on an FM-1 and in fm1-emu, the results kept as
+the emulator's reference.
 
-  tools/hwdsp.py run --on emu|fm1 [--plan fft|vec|all] [--only SUBSTR] [--dock DIR] [--port NAME]
+  tools/hwdsp.py run --on emu|fm1 [--plan fft|vec|eq|all] [--only SUBSTR] [--dock DIR] [--port NAME]
       runs the plan's cases (one probe run each) and merges what came back into tests/hwdsp/ON.json
   tools/hwdsp.py compare [A B]      case by case, where two result files differ (default emu fm1)
   tools/hwdsp.py fit [ON]           each FFT case against the exact transform (numpy): the scale
@@ -200,6 +201,105 @@ def plan_vec():
     return c
 
 
+# ---- the EQ ----------------------------------------------------------------------------------
+
+def f2w(f):
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+
+def w2f(w):
+    return struct.unpack("<f", struct.pack("<I", w & 0xFFFFFFFF))[0]
+
+
+def rbj(kind, fc, q, gain_db=0.0, fs=44100):
+    """a section as the SDK's eq_design.c makes it: [b0/a0, -a2/a0, b2/b0, -a1/a0, b1/b0] (the cookbook's;
+    without eq_coef_adj's mantissa nudge)"""
+    import math
+    w = 2 * math.pi * fc / fs
+    al, cw = math.sin(w) / (2 * q), math.cos(w)
+    if kind == "lp":
+        b0, b1, b2, a0, a1, a2 = (1 - cw) / 2, 1 - cw, (1 - cw) / 2, 1 + al, -2 * cw, 1 - al
+    elif kind == "hp":
+        b0, b1, b2, a0, a1, a2 = (1 + cw) / 2, -(1 + cw), (1 + cw) / 2, 1 + al, -2 * cw, 1 - al
+    else:                                       # peaking
+        A = 10 ** (gain_db / 40)
+        b0, b1, b2, a0, a1, a2 = 1 + al * A, -2 * cw, 1 - al * A, 1 + al / A, -2 * cw, 1 - al / A
+    return [b0 / a0, -a2 / a0, b2 / b0, -a1 / a0, b1 / b0]
+
+
+DESIGNS = {
+    "lp1k": rbj("lp", 1000, 0.707), "hp200": rbj("hp", 200, 0.707), "pe1k+6": rbj("pe", 1000, 1.0, 6),
+    "pe3k-9q4": rbj("pe", 3000, 4.0, -9), "lp5k_q20": rbj("lp", 5000, 20.0), "pe100+12q.3": rbj("pe", 100, 0.3, 12),
+}
+F_S16, F_S32, F_F32 = 0, 1, 2
+
+
+def eqjob(slots, fmt_in=F_F32, fmt_out=F_F32, ch=1, och=None, n=256, gen=RANDOM, amp=10000, seed=7, nsec=None,
+          inter_in=0, inter_out=0, run=0, cpu_only=0, nslots=None, out_n=None, extra=0, marker=0):
+    """probes/hweq.c's argument: slots are [5 coefficients] or [5 + 3 state words] (floats or words)"""
+    och = och or ch
+    nsec = nsec or len(slots) // ch
+    words = []
+    for sl in slots:
+        w = [f2w(v) if isinstance(v, float) else v for v in sl]
+        words += (w + [0, 0, 0])[:8]
+    given = len(slots)
+    nslots = nslots or given
+    fmt = nsec | fmt_in << 8 | fmt_out << 10 | run << 12 | inter_in << 14 | inter_out << 15 | ch << 16 | och << 20 | cpu_only << 24
+    ob = 2 if fmt_out == F_S16 else 4
+    out_n = out_n or min(1500, (n * och * ob + 3) // 4)
+    return [1, fmt, n, gen, amp, seed, out_n, extra, nslots | given << 8 | marker << 16] + words
+
+
+def plan_eq():
+    D = DESIGNS
+    c = [("eq/regs", [0])]
+    for name, sec in D.items():
+        c.append((f"eq/f32/{name}/rnd", eqjob([sec])))
+        c.append((f"eq/f32/{name}/imp", eqjob([sec], gen=IMPULSE, amp=1, seed=0, n=128)))
+    c += [
+        ("eq/f32/one", eqjob([[1.0, 0.0, 0.0, 0.0, 0.0]])),
+        ("eq/f32/cascade3", eqjob([D["lp1k"], D["pe1k+6"], D["hp200"]])),
+        ("eq/f32/20sec", eqjob([D["lp5k_q20"], D["pe3k-9q4"], D["pe100+12q.3"]], nsec=20, nslots=20)),
+        ("eq/f32/stereo20_spill", eqjob([D["pe1k+6"], D["hp200"]], ch=2, nsec=20, nslots=40, n=128)),
+        ("eq/f32/stereo20_cpu", eqjob([D["pe1k+6"], D["hp200"]], ch=2, nsec=20, nslots=40, n=128, cpu_only=1)),
+        ("eq/f32/mono_cpu", eqjob([D["pe1k+6"]], cpu_only=1)),
+        ("eq/f32/stereo_block", eqjob([D["lp1k"], D["hp200"]], ch=2, nsec=1, n=128)),
+        ("eq/f32/stereo_inter", eqjob([D["lp1k"], D["hp200"]], ch=2, nsec=1, n=128, inter_in=1, inter_out=1)),
+        ("eq/f32/stereo_block_to_inter", eqjob([D["lp1k"], D["hp200"]], ch=2, nsec=1, n=128, inter_out=1)),
+        ("eq/f32/stereo_2sec", eqjob([D["lp1k"], D["pe1k+6"], D["hp200"], D["pe3k-9q4"]], ch=2, nsec=2, n=128)),
+        ("eq/f32/run1_mono_to_2", eqjob([D["lp1k"], D["hp200"]], ch=1, och=2, nsec=1, n=128, run=1)),
+        ("eq/f32/run2_stereo_to_4", eqjob([D["lp1k"], D["hp200"], D["pe1k+6"], D["pe3k-9q4"]], ch=2, och=4, nsec=1, n=64, run=2)),
+        ("eq/s16/pe1k+6/rnd", eqjob([D["pe1k+6"]], F_S16, F_S16, amp=20000)),
+        ("eq/s16/lp1k/rnd", eqjob([D["lp1k"]], F_S16, F_S16, amp=8000)),
+        ("eq/s16/gain2_sat", eqjob([[2.0, 0.0, 0.0, 0.0, 0.0]], F_S16, F_S16, amp=32767)),
+        ("eq/s16/round_half", eqjob([[0.5, 0.0, 0.0, 0.0, 0.0]], F_S16, F_S16, gen=RAMP, amp=1, seed=-40 & 0xFFFFFFFF, n=80)),
+        ("eq/s16/round_quarter", eqjob([[0.25, 0.0, 0.0, 0.0, 0.0]], F_S16, F_S16, gen=RAMP, amp=1, seed=-40 & 0xFFFFFFFF, n=80)),
+        ("eq/s32/pe1k+6/rnd", eqjob([D["pe1k+6"]], F_S32, F_S32, amp=1 << 24)),
+        ("eq/s32/one", eqjob([[1.0, 0.0, 0.0, 0.0, 0.0]], F_S32, F_S32, gen=RAW, amp=0, seed=5)),
+        ("eq/s32/gain2_sat", eqjob([[2.0, 0.0, 0.0, 0.0, 0.0]], F_S32, F_S32, gen=RAW, amp=0, seed=5)),
+        ("eq/s32/round_half", eqjob([[0.5, 0.0, 0.0, 0.0, 0.0]], F_S32, F_S32, gen=RAMP, amp=1, seed=-40 & 0xFFFFFFFF, n=80)),
+        ("eq/s16_to_f32", eqjob([D["pe1k+6"]], F_S16, F_F32, amp=20000)),
+        ("eq/f32_to_s16", eqjob([D["pe1k+6"]], F_F32, F_S16, amp=20000)),
+        ("eq/s16_to_s32", eqjob([[1.0, 0.0, 0.0, 0.0, 0.0]], F_S16, F_S32, gen=RAMP, amp=777, seed=-20000 & 0xFFFFFFFF, n=64)),
+        ("eq/s32_to_s16", eqjob([[1.0, 0.0, 0.0, 0.0, 0.0]], F_S32, F_S16, gen=RAMP, amp=1 << 20, seed=0, n=64)),
+        ("eq/f32/long", eqjob([D["pe1k+6"]], n=1024, out_n=1024)),
+    ]
+    # where each slot is read from (the EQ's RAM holds 26; then FLT_ADR): every slot passes, one halves
+    one, half = [1.0, 0.0, 0.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.0, 0.0]
+    for m in range(40):
+        c.append((f"eq/where/spill/{m}", eqjob([one, half], ch=2, nsec=20, nslots=40, n=8, gen=DC, amp=1000, marker=m + 1)))
+    for m in range(0, 40, 3):
+        c.append((f"eq/where/cpu/{m}", eqjob([one, half], ch=2, nsec=20, nslots=40, n=8, gen=DC, amp=1000, marker=m + 1,
+                                            cpu_only=1)))
+    # the three state words: zero input, one word set, a section that feeds back
+    for k in range(3):
+        st = [0, 0, 0]
+        st[k] = f2w(1000.0)
+        c.append((f"eq/f32/state{k}", eqjob([[1.0, 0.25, 0.5, 0.5, 0.75] + st], gen=ZEROS, amp=0, n=8)))
+    return c
+
+
 def plan(name):
     if name == "fft":
         return plan_fft()
@@ -207,7 +307,9 @@ def plan(name):
         return plan_fft(True)
     if name == "vec":
         return plan_vec()
-    return [("regs", [0])] + plan_fft() + plan_vec()
+    if name == "eq":
+        return plan_eq()
+    return [("regs", [0])] + plan_fft() + plan_vec() + plan_eq()
 
 
 def load(on):
@@ -220,15 +322,16 @@ def cmd_run(a):
     sys.path.insert(0, str(dock / "tools"))
     os.environ.setdefault("FM1_LIVE", str(ROOT / "target" / "release" / "fm1-live"))
     import probe  # fm1-dock's tools/probe.py
-    blob_p = dock / "build" / "probes" / "hwdsp.dock"
-    for _ in range(5):                          # (the Docker build is flaky on macOS: try again)
-        try:
-            blob = probe.build(dock / "probes" / "hwdsp.c")
-            break
-        except SystemExit as e:
-            print(f"build: {e}; again", file=sys.stderr)
-    else:
-        blob = blob_p.read_bytes()
+    blobs = {}
+    for name in ("hwdsp", "hweq"):
+        for _ in range(5):                      # (the Docker build is flaky on macOS: try again)
+            try:
+                blobs[name] = probe.build(dock / "probes" / f"{name}.c")
+                break
+            except SystemExit as e:
+                print(f"build: {e}; again", file=sys.stderr)
+        else:
+            blobs[name] = (dock / "build" / "probes" / f"{name}.dock").read_bytes()
     OUT.mkdir(parents=True, exist_ok=True)
     res = load(a.on)
     cases = [c for c in plan(a.plan) if a.only in c[0]]
@@ -236,6 +339,7 @@ def cmd_run(a):
         if cid in res and not a.again:
             continue
         arg = b"".join(struct.pack("<I", int(x) & 0xFFFFFFFF) for x in args)
+        blob = blobs["hweq" if cid.startswith("eq/") else "hwdsp"]
         r = probe.run_emu(blob, arg, a.ms) if a.on == "emu" else probe.run_fm1(blob, arg, a.ms, a.port)
         r = {"args": args, **{k2: v for k2, v in r.items() if k2 in ("state", "rc", "result", "crash_pc")}}
         res[cid] = r
@@ -323,7 +427,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--on", default="emu", choices=("emu", "fm1"))
-    r.add_argument("--plan", default="all", choices=("all", "fft", "fftfull", "vec"))
+    r.add_argument("--plan", default="all", choices=("all", "fft", "fftfull", "vec", "eq"))
     r.add_argument("--only", default="")
     r.add_argument("--again", action="store_true", help="run cases already in the file again")
     r.add_argument("--dock", default=str(ROOT.parent / "fm1-harbor"))
