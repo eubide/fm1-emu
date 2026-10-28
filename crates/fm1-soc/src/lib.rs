@@ -695,16 +695,7 @@ impl Soc {
     fn spi1_write(&mut self, addr: u32, value: u32) {
         match addr {
             0x11d00 => {
-                // CON: bit14 clears the pending transfer-done (and its IRQ 16), bit13 enables
-                // the IRQ. The FM-1's stock LCD driver disables it before a transfer's interrupt
-                // is due; taken anyway, the interrupt finds its handler idle, which returns
-                // without clearing it, again and again.
-                if value & 0x4000 != 0 {
-                    self.periph.spi1_pending = false;
-                }
-                if value & 0x2000 == 0 {
-                    self.periph.spi1_irq_off();
-                }
+                self.periph.spi1_con(value);
                 // (bit 15, done, is the read's; bit 14 only acts)
                 self.sfr_set(addr, value & !0xc000);
             }
@@ -715,7 +706,7 @@ impl Soc {
                     self.lcd.feed(value as u8, dc);
                 }
                 self.sfr_set(addr, value);
-                self.spi1_done(1);
+                self.spi1_sent(1);
             }
             0x11d0c => self.sfr_set(addr, value), // ADR
             0x11d10 => {
@@ -733,7 +724,7 @@ impl Soc {
                     None => self.periph.smk.pad_frame(&bytes),
                 }
                 self.sfr_set(addr, 0);
-                self.spi1_done(n);
+                self.spi1_sent(n);
             }
             _ => self.sfr_set(addr, value),
         }
@@ -783,19 +774,12 @@ impl Soc {
         self.periph.spi2_start(bytes, baud, con & 0x2000 != 0);
     }
 
-    /// A SPI1 transfer finished: with CON bit 13 (interrupt enable) that is IRQ 16, the stock
-    /// LCD driver's DMA-done (its layer flush waits for the handler). The interrupt comes after
-    /// the bytes' time on the wire (`Periph::spi1_start`): FM-1 V16's driver enables it, starts
-    /// the DMA and only then marks the DMA as running, so an interrupt at the start found its
-    /// handler idle, which returned without clearing it, again and again. On the FM-1 the
-    /// transfer-done bit still reads as set at once (polls finish); the SMK-37's is busy until the
-    /// bytes have gone out.
-    fn spi1_done(&mut self, bytes: u32) {
+    /// A SPI1 transfer: with CON bit 13 its IRQ 16 is the stock LCD driver's DMA-done (its layer
+    /// flush waits for the handler).
+    fn spi1_sent(&mut self, bytes: u32) {
         let irq = self.sfr_get(0x11d00) & 0x2000 != 0;
-        if self.board == Board::Smk37 || irq {
-            let baud = self.sfr_get(0x11d04);
-            self.periph.spi1_start(bytes, baud, irq);
-        }
+        let baud = self.sfr_get(0x11d04);
+        self.periph.spi1_transfer(bytes, baud, irq);
     }
 
     fn timer_read(&mut self, addr: u32) -> u32 {
@@ -1012,10 +996,7 @@ impl Soc {
             Region::Spi2 => self.sfr_get(addr) | if addr == 0x11e00 { 0x8000 } else { 0 },
             Region::Spi1 => {
                 if addr == 0x11d00 {
-                    // CON: transfer-done (the FM-1: always, so polls finish; the SMK-37: once the
-                    // bytes have gone out)
-                    let busy = self.board == Board::Smk37 && self.periph.cycles < self.periph.spi1_done_at;
-                    self.sfr_get(addr) | if busy { 0 } else { 0x8000 }
+                    self.sfr_get(addr) | if self.periph.spi1_done() { 0x8000 } else { 0 }
                 } else if addr == 0x11d10 {
                     self.sfr_get(addr)
                 } else {

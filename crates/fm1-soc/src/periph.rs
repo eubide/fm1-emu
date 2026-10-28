@@ -207,13 +207,7 @@ pub struct Periph {
     tick_start: u64,
     tick_next: u64,
     tick_pending: bool,
-    /// SPI1 finished a transfer with its interrupt enabled (CON bit 13); CON bit 14 clears.
-    pub spi1_pending: bool,
-    /// SMK-37: the cycle SPI1's transfer in progress ends at (CON's done bit reads set from
-    /// then), and its interrupt's (u64::MAX: none). Its stock firmware redraws as often as the
-    /// screen's DMA lets it: finishing at once, ~185 frames a second through the LCD model.
-    pub spi1_done_at: u64,
-    spi1_irq_at: u64,
+    spi1: Spi1,
     /// SARADC: a conversion finished (CON bit 7), and its IRQ 24 when CON bit 5 enabled it.
     adc_done: bool,
     adc_irq: bool,
@@ -288,6 +282,23 @@ pub enum Action {
     KeyVel { vel: u8 },
     /// FM-1: a held key pressed to the force of velocity `vel` (aftertouch; 1..127).
     Pressure { id: u8, vel: u8 },
+}
+
+/// SPI1's transfer: when the one in progress ends, and its interrupt (IRQ 16).
+#[derive(Debug, Clone, Copy)]
+struct Spi1 {
+    /// The cycle the transfer in progress ends at (`Periph::spi1_done`).
+    done_at: u64,
+    /// The cycle its interrupt is raised at (u64::MAX: none to come).
+    irq_at: u64,
+    /// Raised and not cleared yet (CON bit 14, or bit 13 off).
+    pending: bool,
+}
+
+impl Default for Spi1 {
+    fn default() -> Self {
+        Self { done_at: 0, irq_at: u64::MAX, pending: false }
+    }
 }
 
 /// A key's force: from `from` to `to` (0..1) over `dur` cycles from cycle `t0`.
@@ -365,9 +376,7 @@ impl Default for Periph {
             tick_start: 0,
             tick_next: u64::MAX,
             tick_pending: false,
-            spi1_pending: false,
-            spi1_done_at: 0,
-            spi1_irq_at: u64::MAX,
+            spi1: Spi1::default(),
             adc_done: false,
             adc_irq: false,
             adc_next: u64::MAX,
@@ -469,7 +478,7 @@ impl Periph {
 
     /// The next cycle at which something timed happens.
     fn next_event(&self) -> u64 {
-        let mut n = self.t5_next.min(self.alnk_next).min(self.tick_next).min(self.spi2_next).min(self.adc_next).min(self.spi1_irq_at);
+        let mut n = self.t5_next.min(self.alnk_next).min(self.tick_next).min(self.spi2_next).min(self.adc_next).min(self.spi1.irq_at);
         n = n.min(self.uart.next).min(self.uart.ot_next).min(self.usb_next).min(self.wdt_at);
         for t in &self.tmr {
             n = n.min(t.next);
@@ -504,9 +513,9 @@ impl Periph {
             self.spi2_pending = true;
             self.spi2_next = u64::MAX;
         }
-        if self.cycles >= self.spi1_irq_at {
-            self.spi1_irq_at = u64::MAX;
-            self.spi1_pending = true;
+        if self.cycles >= self.spi1.irq_at {
+            self.spi1.irq_at = u64::MAX;
+            self.spi1.pending = true;
         }
         if self.cycles >= self.adc_next {
             self.adc_next = u64::MAX;
@@ -761,7 +770,7 @@ impl Periph {
     /// Any interrupt source pending at all (before enables and priorities).
     #[inline(always)]
     pub fn any_pending(&self) -> bool {
-        self.t5_pending || self.alnk_pend & 0xf0 != 0 || self.ilat != 0 || self.tick_pending || self.spi1_pending
+        self.t5_pending || self.alnk_pend & 0xf0 != 0 || self.ilat != 0 || self.tick_pending || self.spi1.pending
             || self.tmr.iter().any(|t| t.pending) || self.adc_irq || self.spi2_pending || self.uart_irq
     }
 
@@ -793,7 +802,7 @@ impl Periph {
         if self.tick_pending {
             consider(IRQ_OS_TICK);
         }
-        if self.spi1_pending {
+        if self.spi1.pending {
             consider(IRQ_SPI1);
         }
         if self.adc_irq {
@@ -1211,22 +1220,42 @@ impl Periph {
         }
     }
 
-    /// SMK-37: an SPI1 transfer of `bytes` started at BAUD `baud` (the clock 60 MHz / (baud + 1):
-    /// ~12 MHz at 4 for the LCD, 6.67 MHz at 8 for the pad LEDs); with `irq` IRQ 16 at its end.
-    pub fn spi1_start(&mut self, bytes: u32, baud: u32, irq: bool) {
+    /// SPI1 sent `bytes` (BUF, or a DMA through CNT) at BAUD `baud` (the clock 60 MHz / (baud + 1):
+    /// ~12 MHz at 4 for the LCD, 6.67 MHz at 8 for the pad LEDs), with IRQ 16 at the end when
+    /// `irq` (CON bit 13). They take their time on the wire where something waits for it: the
+    /// SMK-37's done bit, an interrupt. FM-1 V16's LCD driver enables the interrupt, starts the
+    /// DMA and only then marks it running: an interrupt at the start found its handler idle,
+    /// which returned without clearing it, again and again.
+    pub fn spi1_transfer(&mut self, bytes: u32, baud: u32, irq: bool) {
+        if self.board != crate::Board::Smk37 && !irq {
+            return;
+        }
         let clk = 60_000_000 / (baud as u64 + 1);
         let dur = (bytes.max(1) as u64 * 8 * self.hz / clk).max(1);
-        self.spi1_done_at = self.cycles + dur;
+        self.spi1.done_at = self.cycles + dur;
         if irq {
-            self.spi1_irq_at = self.spi1_done_at;
+            self.spi1.irq_at = self.spi1.done_at;
             self.next_due = 0;
         }
     }
 
-    /// CON bit 13 cleared: IRQ 16 neither stays raised nor comes at the transfer's end.
-    pub fn spi1_irq_off(&mut self) {
-        self.spi1_pending = false;
-        self.spi1_irq_at = u64::MAX;
+    /// A CON write: bit 14 clears a raised IRQ 16; bit 13 off disables it, raised or still to
+    /// come. The FM-1's stock LCD driver disables it before a transfer's interrupt is due; taken
+    /// anyway, the interrupt finds its handler idle, which returns without clearing it.
+    pub fn spi1_con(&mut self, value: u32) {
+        if value & 0x4000 != 0 {
+            self.spi1.pending = false;
+        }
+        if value & 0x2000 == 0 {
+            self.spi1.pending = false;
+            self.spi1.irq_at = u64::MAX;
+        }
+    }
+
+    /// CON's done bit (15): the SMK-37's once the bytes have gone out; the FM-1's always, so
+    /// polls finish.
+    pub fn spi1_done(&self) -> bool {
+        self.board != crate::Board::Smk37 || self.cycles >= self.spi1.done_at
     }
 
     /// A SPI2 transfer of `bytes` started (with its interrupt enabled when `irq`): it takes
