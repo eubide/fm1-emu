@@ -77,9 +77,9 @@ pub struct Ctx {
     stop: u32,
     /// inside a then-part or rep loop: a pair does not stop for an interrupt (`h_pair`)
     inside: u32,
-    /// it left inside an if-else block's then-part: its (end, else part's end), for
+    /// it left inside an if-else block's then-part: its (end, else part's end, start), for
     /// `Cpu::pred_skips` (0: not)
-    pred: [u32; 2],
+    pred: [u32; 3],
     code_version: Option<u64>,
 }
 const OFF_BRK: u32 = 24;
@@ -452,16 +452,16 @@ pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, me
         ver: bus.code_writes().unwrap_or(u64::MAX - 1),
         stop: 0,
         inside: inside as u32,
-        pred: [0; 2],
+        pred: [0; 3],
         code_version: bus.code_writes(),
     };
     let f: CodeFn = unsafe { std::mem::transmute(code) };
     let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit, mem.ram_code);
     if ctx.pred[0] != 0 {
         // (as the if-else op put it there)
-        let (te, ee) = (ctx.pred[0], ctx.pred[1]);
-        cpu.pred_skips.retain(|&(t, _)| t != te);
-        cpu.pred_skips.push((te, ee));
+        let (te, ee, ts) = (ctx.pred[0], ctx.pred[1], ctx.pred[2]);
+        cpu.pred_skips.retain(|&(t, _, _)| t != te);
+        cpu.pred_skips.push((te, ee, ts));
     }
     if k > 0 {
         // the ticks of the instructions run, less those the helpers applied already
@@ -1089,8 +1089,8 @@ impl Gen<'_> {
         }
     }
     /// Inside an if-else block's then-part, after an op that may have used the bus: leave if
-    /// the next tick is due, with the skip (te, ee) for `Cpu::pred_skips` (`Ctx::pred`).
-    fn check_brk_pred(&mut self, next_pc: u32, count: u32, te: u32, ee: u32) {
+    /// the next tick is due, with the skip (te, ee, ts) for `Cpu::pred_skips` (`Ctx::pred`).
+    fn check_brk_pred(&mut self, next_pc: u32, count: u32, te: u32, ee: u32, ts: u32) {
         let go = self.a.label();
         self.a.ldr(9, CTX, OFF_BRK);
         self.a.cbz(9, go);
@@ -1098,6 +1098,8 @@ impl Gen<'_> {
         self.a.str(9, CTX, OFF_PRED);
         self.a.mov32(9, ee);
         self.a.str(9, CTX, OFF_PRED + 4);
+        self.a.mov32(9, ts);
+        self.a.str(9, CTX, OFF_PRED + 8);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
@@ -1821,7 +1823,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
             for (k, t) in then.iter().enumerate() {
                 let tnext = tpc + t.len as u32;
                 if emit_op::<B>(&mut g, t.fast, j, tnext, profile) && k + 1 < then.len() {
-                    g.check_brk_pred(tnext, j + 1, te, ee);
+                    g.check_brk_pred(tnext, j + 1, te, ee, next_pc);
                 }
                 (tpc, j) = (tnext, j + 1);
             }

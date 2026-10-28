@@ -201,8 +201,9 @@ pub struct Cpu {
     pub rep_reg: Option<usize>,
     pub rep_count: u32,
     /// Predicated `if {} else {}` blocks whose then-part is executing:
-    /// (then_end, else_end) — reaching then_end jumps over the else-part.
-    pub pred_skips: Vec<(u32, u32)>,
+    /// (then_end, else_end, then_start) — reaching then_end jumps over the else-part; a jump
+    /// from inside the then-part to before its start leaves the construct (`pred_left_back`).
+    pub pred_skips: Vec<(u32, u32, u32)>,
     /// Condition flag set by `testset` (see its arm for the assumed sense).
     pub cc: bool,
     /// Arithmetic flags in `psr`'s low bits (F_N | F_C | F_Z | F_V), set by the add / subtract
@@ -645,7 +646,7 @@ impl Cpu {
                         None => None,
                     };
                     let code = code.filter(|p| !inside || self.prefix_inside(pc, p.end));
-                    if let Some(jit::Prefix { code, insns, whole: compiled_whole, .. }) = code {
+                    if let Some(jit::Prefix { code, insns, end, whole: compiled_whole, .. }) = code {
                         // (the code checks itself that its ticks fall before anything is due)
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
@@ -687,7 +688,7 @@ impl Cpu {
                             if inside && !self.pred_skips.is_empty() {
                                 // (the then-part's rule for where its last instruction went; after
                                 // the link: the slot goes to where the code left, not past a skip)
-                                pc = self.finish_inside(entry);
+                                pc = self.finish_inside(entry, end);
                                 if self.pred_skips.is_empty() && bus.irq_pending() {
                                     self.insn_count += (n - synced) as u64;
                                     return Ok((n, false));
@@ -825,7 +826,7 @@ impl Cpu {
     #[cfg(native_jit)]
     #[inline]
     fn prefix_inside(&self, pc: u32, end: u32) -> bool {
-        !(self.rep_end > pc && self.rep_end <= end) && self.pred_skips.iter().all(|&(te, _)| te >= end)
+        !(self.rep_end > pc && self.rep_end <= end) && self.pred_skips.iter().all(|&(te, _, _)| te >= end)
     }
 
     /// Is a then-part or a rep loop (one of them) all that is in progress?
@@ -835,20 +836,20 @@ impl Cpu {
         self.pair_pending.is_none() && self.hold_irq == 0 && ((self.rep_end != 0) != !self.pred_skips.is_empty())
     }
 
-    /// After a compiled prefix inside a then-part (`prefix_inside`): `finish`'s skip rule for
-    /// where its last instruction went (none before it reached a then-part's end); the pc. The
-    /// careful path then stops if that ended the construct and an interrupt is pending.
+    /// After a compiled prefix (`entry..end`) inside a then-part (`prefix_inside`): `finish`'s
+    /// skip rule for where its last instruction went (none before it reached a then-part's end);
+    /// the pc. The careful path then stops if that ended the construct and an interrupt is pending.
     #[cfg(native_jit)]
     #[inline(never)]
-    fn finish_inside(&mut self, entry: u32) -> u32 {
+    fn finish_inside(&mut self, entry: u32, end: u32) -> u32 {
         let pc = self.pc;
-        if let Some(i) = self.pred_skips.iter().position(|&(te, _)| te == pc) {
+        if let Some(i) = self.pred_skips.iter().position(|&(te, _, _)| te == pc) {
             self.pc = self.pred_skips.remove(i).1;
         }
         let (pc, rets) = (self.pc, self.rets);
-        // (as `finish`: out past the then-part, or a goto back out of it; the prefix lies inside
-        // the then-part and ends at its jump, so its entry stands for the jump's place)
-        self.pred_skips.retain(|&(te, _)| pc <= te && !pred_left_back(entry, pc, te, rets));
+        // (as `finish`: out past the then-part, or a goto back out of it; the prefix ends at its
+        // jump, which lies in the then-part when the prefix does, and `end` is the jump's next pc)
+        self.pred_skips.retain(|&(te, _, ts)| pc <= te && !(ts <= entry && end <= te && pred_left_back(pc, ts, end, rets)));
         pc
     }
 
@@ -895,9 +896,9 @@ impl Cpu {
             let at = self.pc;
             let mut pc = self.exec_fast(bus, op.fast, next_pc).unwrap_or(next_pc);
             self.insn_count += 1;
-            let (te, ee) = self.pred_skips[0];
+            let (te, ee, ts) = self.pred_skips[0];
             let mut still = true;
-            if pred_left_back(at, pc, te, self.rets) {
+            if ts <= at && at < te && pred_left_back(pc, ts, next_pc, self.rets) {
                 self.pred_skips.clear(); // a goto back out of the construct (`finish`)
                 still = false;
             } else if pc >= te {
@@ -1591,8 +1592,8 @@ impl Cpu {
                 if taken {
                     if has_else {
                         let else_end = then_end.wrapping_add(else_d as u32);
-                        self.pred_skips.retain(|&(te, _)| te != then_end);
-                        self.pred_skips.push((then_end, else_end));
+                        self.pred_skips.retain(|&(te, _, _)| te != then_end);
+                        self.pred_skips.push((then_end, else_end, next_pc));
                     }
                 } else {
                     return Some(then_end);
@@ -2828,8 +2829,8 @@ impl Cpu {
                 let else_end = self.block_end(bus, then_end, blk.else_units);
                 if taken {
                     if blk.else_units > 0 {
-                        self.pred_skips.retain(|&(te, _)| te != then_end);
-                        self.pred_skips.push((then_end, else_end));
+                        self.pred_skips.retain(|&(te, _, _)| te != then_end);
+                        self.pred_skips.push((then_end, else_end, next_pc));
                     }
                 } else {
                     jumped = Some(then_end);
@@ -3352,14 +3353,14 @@ impl Cpu {
         self.pc = jumped.unwrap_or(next_pc);
         if !self.pred_skips.is_empty() {
             let pc = self.pc;
-            if let Some(i) = self.pred_skips.iter().position(|&(te, _)| te == pc) {
-                let (_, ee) = self.pred_skips.remove(i);
+            if let Some(i) = self.pred_skips.iter().position(|&(te, _, _)| te == pc) {
+                let (_, ee, _) = self.pred_skips.remove(i);
                 self.pc = ee;
             }
             let (pc, rets, back) = (self.pc, self.rets, jumped.is_some());
             // a branch out of the construct abandons its pending skip: past its then-part, or a
-            // goto back out of it (`pred_left_back`)
-            self.pred_skips.retain(|&(te, _)| pc <= te && !(back && pred_left_back(at, pc, te, rets)));
+            // goto from inside it back out of it (`pred_left_back`)
+            self.pred_skips.retain(|&(te, _, ts)| pc <= te && !(back && ts <= at && at < te && pred_left_back(pc, ts, next_pc, rets)));
         }
         if self.rep_end != 0 && jumped.is_none() && self.pc == self.rep_end {
             // fell off the end of a rep block: count down, loop or finish
@@ -3961,16 +3962,14 @@ fn decode_pair_mem(raw: u64) -> PairMem {
     }
 }
 
-/// A then-part is 1..4 instructions (`decode_if_block`): at most this many bytes.
-const THEN_MAX: u32 = 32;
-
-/// Did a jump from `at` to `pc` leave a then-part ending at `te` backwards (clang's tail call
-/// `if (c) { goto f } else { .. }` with f before it)? Only from an instruction inside the
-/// then-part, and not a call: one returns into the construct (`rets` just set inside it), and
-/// a callee's own loops (`at` outside the then-part) leave nothing.
+/// Did a jump to `pc` by an instruction inside a then-part starting at `ts` (the caller checks
+/// that) leave the construct backwards (clang's tail call `if (c) { goto f } else { .. }` with f
+/// before it)? Not a call, which returns into the construct: a call sets `rets` to its own next
+/// pc, `next_pc`, and nothing else does. (A callee's own loops are jumps by instructions outside
+/// the then-part: they leave nothing.)
 #[inline]
-fn pred_left_back(at: u32, pc: u32, te: u32, rets: u32) -> bool {
-    pc < at && at < te && te - at <= THEN_MAX && !(rets > at && rets <= te)
+fn pred_left_back(pc: u32, ts: u32, next_pc: u32, rets: u32) -> bool {
+    pc < ts && rets != next_pc
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4927,6 +4926,78 @@ mod tests {
                 }
                 assert!(fast > 0 && (!jit || cpu.jit_insns > 0), "call {call}, jit {jit}: {fast} fast, {} compiled", cpu.jit_insns);
             }
+        }
+    }
+
+    /// `if (r0 != 0) { call g } else { r0 = 0 }; r6 += 1`, with g at 0x60 a function of its own
+    /// with a loop in it (`call h; goto +; -: pc = [sp++]; +: goto -`) and h at 0x10 (`r5 += 1;
+    /// rts`): the construct is in progress all through g (interrupts wait), g's jump back is by
+    /// an instruction outside the then-part and ends nothing, and g's return to the then-part's
+    /// end skips the else part. (A skip that knew only its end once took g's jump back, near
+    /// that end with `rets` left in g by h's return, for a goto out of the then-part.)
+    fn callee_loop_program() -> Vec<u8> {
+        // (`xx ea lo hi`: the offset in halfwords from the next pc, its high bits in xx's low
+        // five: `ff` a goto back, `c0` a goto on, `bf` a call back)
+        let jump = |op: u8, next_pc: u32, to: u32| { let d = ((to as i32 - next_pc as i32) / 2) as i16 as u16; [op, 0xea, d as u8, (d >> 8) as u8] };
+        let mut mem = vec![0u8; 0x200];
+        mem[0x10..0x14].copy_from_slice(&[0xc5, 0x21, 0x80, 0x00]);
+        mem[0x60..0x62].copy_from_slice(&[0x10, 0x04]); // [--sp] = rets
+        mem[0x62..0x66].copy_from_slice(&jump(0xbf, 0x66, 0x10));
+        mem[0x66..0x6a].copy_from_slice(&jump(0xc0, 0x6a, 0x6c));
+        mem[0x6a..0x6c].copy_from_slice(&[0x00, 0x04]); // pc = [sp++]
+        mem[0x6c..0x70].copy_from_slice(&jump(0xff, 0x70, 0x6a));
+        mem[0x80..0x84].copy_from_slice(&[0xb0, 0xe8, 0x00, 0x10]);
+        mem[0x84..0x88].copy_from_slice(&jump(0xbf, 0x88, 0x60));
+        mem[0x88..0x8a].copy_from_slice(&[0x40, 0x20]);
+        mem[0x8a..0x8c].copy_from_slice(&[0xc6, 0x21]);
+        mem[0x8c..0x90].copy_from_slice(&[0xff, 0xea, 0xfe, 0xff]);
+        mem
+    }
+
+    #[test]
+    fn a_callees_own_loop_does_not_end_the_callers_construct() {
+        let mut ram = FlatRam::new(callee_loop_program());
+        let mut cpu = Cpu::new(0x80);
+        (cpu.regs[0], cpu.sp, cpu.ie) = (1, 0x200, true);
+        cpu.sreg_store[0] |= 0x100;
+        let steps = [0x84, 0x60, 0x62, 0x10, 0x12, 0x66, 0x6c, 0x6a];
+        for (n, &at) in steps.iter().enumerate() {
+            cpu.step(&mut ram).unwrap();
+            assert_eq!(cpu.pc, at, "step {n}");
+            assert!(!cpu.pred_skips.is_empty() && !cpu.irq_ready(4), "step {n} (pc {:#x}): the construct goes on, no interrupt", cpu.pc);
+        }
+        cpu.step(&mut ram).unwrap(); // pc = [sp++]: to the then-part's end, over the else part
+        assert_eq!((cpu.pc, cpu.regs[0]), (0x8a, 1), "the else part skipped");
+        assert!(cpu.pred_skips.is_empty() && cpu.irq_ready(4));
+        cpu.step(&mut ram).unwrap();
+        assert_eq!((cpu.pc, cpu.regs[0], cpu.regs[5], cpu.regs[6]), (0x8c, 1, 1, 1));
+    }
+
+    /// `a_callees_own_loop_does_not_end_the_callers_construct` through run_fast, interpreted and
+    /// compiled, from XIP (as `a_goto_back_out_of_a_then_part_ends_the_construct_in_blocks`).
+    #[cfg(native_jit)]
+    #[test]
+    fn a_callees_own_loop_does_not_end_the_callers_construct_in_blocks() {
+        for jit in [false, true] {
+            let mut xip = callee_loop_program();
+            xip.resize(0x200, 0);
+            let mut bus = Clocked { ram: vec![0; 0x1000], xip, cycles: 0, next_due: u64::MAX, irq: false, due_on_mmio: false, writes: 0 };
+            let mut cpu = Cpu::new(0x0200_0080);
+            (cpu.jit_on, cpu.profile) = (jit, true);
+            let mut fast = 0;
+            for round in 0..300u32 {
+                (cpu.pc, cpu.sp, cpu.regs[0], cpu.regs[5], cpu.regs[6]) = (0x0200_0080, 0x1000, 1, 0, 0);
+                cpu.pred_skips.clear();
+                for _ in 0..16 {
+                    match cpu.run_fast(&mut bus, 1 + round % 4).unwrap().0 {
+                        0 => cpu.step(&mut bus).map(|_| ()).unwrap(),
+                        k => fast += k,
+                    }
+                }
+                assert_eq!((cpu.pc, cpu.sp, cpu.regs[0], cpu.regs[5], cpu.regs[6]), (0x0200_008c, 0x1000, 1, 1, 1), "jit {jit}, round {round}");
+                assert!(cpu.pred_skips.is_empty(), "jit {jit}, round {round}: the construct is over");
+            }
+            assert!(fast > 0 && (!jit || cpu.jit_insns > 0), "jit {jit}: {fast} fast, {} compiled", cpu.jit_insns);
         }
     }
 
@@ -5889,7 +5960,7 @@ mod tests {
             // (anywhere in the loop or just past it, often where the first prefix ends)
             let at = |k: u64| 0x0200_0000 + if k % 4 == 0 { 6 } else { 2 * (k % 10) as u32 };
             if x % 2 == 0 {
-                cpu.pred_skips.push((at(x >> 8), at(x >> 16)));
+                cpu.pred_skips.push((at(x >> 8), at(x >> 16), cpu.pc));
             } else if at(x >> 8) != cpu.pc {
                 (cpu.rep_start, cpu.rep_end, cpu.rep_reg, cpu.rep_count) = (cpu.pc, at(x >> 8), None, 1 + (x >> 24) as u32 % 4);
             }
