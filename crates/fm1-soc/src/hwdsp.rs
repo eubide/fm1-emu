@@ -1,6 +1,6 @@
 //! The AC79's FFT / vector unit (JL_FFT at 0x1EE0400: CON, CADR, CONST, TEST1), from JieLi's AC79 SDK
 //! (`apps/common/jl_math/jl_fft.c`, `fftvec_math_drv.h`) and measured on an FM-1 (fm1-dock's
-//! probes/hwdsp.c, `tools/hwdsp.py`: tests/hwdsp/fm1.json is what the chip returned).
+//! probes/hwdsp.c, `tools/hwdsp.py`: tests/hwdsp/fm1.txt is what the chip returned).
 //!
 //! A job is a descriptor in RAM that CADR points at; writing CON with bit 0 (en) runs it, bit 3 picks
 //! the vector unit over the FFT, bits 8.. the number of descriptors in a row (FFT: 16 bytes each),
@@ -207,13 +207,13 @@ pub fn fft(con: u32, input: &[i32]) -> Vec<i32> {
 
 fn fft_job(m: &mut impl Mem, d: u32) -> u64 {
     let con = m.rd(d);
-    let (iadr, oadr) = (m.rd(d + 4), m.rd(d + 8));
+    let (iadr, oadr) = (m.rd(d.wrapping_add(4)), m.rd(d.wrapping_add(8)));
     let (ni, no) = fft_words(con);
-    let input: Vec<i32> = (0..ni).map(|k| m.rd(iadr + 4 * k as u32) as i32).collect();
+    let input: Vec<i32> = (0..ni).map(|k| m.rd(iadr.wrapping_add(4 * k as u32)) as i32).collect();
     let out = fft(con, &input);
     let at = if con & 1 != 0 { iadr } else { oadr };
     for (k, v) in out.iter().enumerate().take(no) {
-        m.wr(at + 4 * k as u32, *v as u32);
+        m.wr(at.wrapping_add(4 * k as u32), *v as u32);
     }
     fft_cycles(con)
 }
@@ -238,17 +238,17 @@ fn wbytes(w: u32) -> u32 {
 }
 
 fn load(m: &mut impl Mem, base: u32, w: u32, i: u32) -> i64 {
-    let a = base.wrapping_add(i * wbytes(w));
+    let a = base.wrapping_add(i.wrapping_mul(wbytes(w)));
     match w {
         0 => (m.rd(a & !3) >> ((a & 3) * 8)) as u8 as i8 as i64,
         1 => (m.rd(a & !3) >> ((a & 2) * 8)) as u16 as i16 as i64,
         2 => m.rd(a) as i32 as i64,
-        _ => ((m.rd(a + 4) as u64) << 32 | m.rd(a) as u64) as i64,
+        _ => ((m.rd(a.wrapping_add(4)) as u64) << 32 | m.rd(a) as u64) as i64,
     }
 }
 
 fn store(m: &mut impl Mem, base: u32, w: u32, i: u32, v: i64) {
-    let a = base.wrapping_add(i * wbytes(w));
+    let a = base.wrapping_add(i.wrapping_mul(wbytes(w)));
     match w {
         0 | 1 => {
             let sh = (a & 3) * 8;
@@ -259,7 +259,7 @@ fn store(m: &mut impl Mem, base: u32, w: u32, i: u32, v: i64) {
         2 => m.wr(a, v as u32),
         _ => {
             m.wr(a, v as u32);
-            m.wr(a + 4, (v >> 32) as u32);
+            m.wr(a.wrapping_add(4), (v >> 32) as u32);
         }
     }
 }
@@ -292,8 +292,8 @@ fn rnd(x: i128, q: i32) -> i128 {
 
 fn vector(m: &mut impl Mem, d: u32, cnst: u32) -> u64 {
     let con = m.rd(d);
-    let (xa, ya, za) = (m.rd(d + 4), m.rd(d + 8), m.rd(d + 12));
-    let (c0, c1) = (m.rd(d + 16), m.rd(d + 20));
+    let (xa, ya, za) = (m.rd(d.wrapping_add(4)), m.rd(d.wrapping_add(8)), m.rd(d.wrapping_add(12)));
+    let (c0, c1) = (m.rd(d.wrapping_add(16)), m.rd(d.wrapping_add(20)));
     let q = (c0 >> 24) as i8 as i32;
     let nloop = ((c0 >> 12) & 0xfff).max(1);
     let nlen = c0 & 0xfff;
@@ -306,7 +306,7 @@ fn vector(m: &mut impl Mem, d: u32, cnst: u32) -> u64 {
     let cpx = mode == 2 || (mode == 3 && con & VEC_CPX_QDT != 0);
     let count = if mode == 2 { nlen } else if cpx { nlen / 2 } else { nlen };
     for l in 0..nloop {
-        let (x0, y0, z0) = (xa.wrapping_add(l * xi), ya.wrapping_add(l * yi), za.wrapping_add(l * zi));
+        let (x0, y0, z0) = (xa.wrapping_add(l * xi), ya.wrapping_add(l * yi), za.wrapping_add(l * zi));   // (l < 4096, inc < 1024)
         let (mut acc, mut acc_i) = (0i128, 0i128);
         for i in 0..count {
             if mode == 2 {
@@ -384,8 +384,10 @@ fn vector(m: &mut impl Mem, d: u32, cnst: u32) -> u64 {
         }
         if accum {
             if mode == 2 {
-                store(m, z0, wz, 0, sat(rnd(acc, q), wz));
-                store(m, z0, wz, 1, sat(rnd(acc_i, q), wz));
+                // (64 bits, wrapping, as the real dot product's: measured there; the complex one's
+                // cases never came near overflowing)
+                store(m, z0, wz, 0, sat(rnd(wrap(acc, 3) as i128, q), wz));
+                store(m, z0, wz, 1, sat(rnd(wrap(acc_i, 3) as i128, q), wz));
             } else if mode == 0 {
                 store(m, z0, wz, 0, 0);
             } else {

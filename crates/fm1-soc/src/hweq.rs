@@ -20,8 +20,9 @@
 //! 1000 is 1000.0). NOT BIT-EXACT: here f64, then rounded; the chip lands within a few f32 ulp of it
 //! (its own number format: -32.0 comes back as -31.999998). The state words: the chip keeps s2 in
 //! word 5 and s1 in word 6 as fixed point (x 2^-32 while word 7 is 0); this model keeps its own f64
-//! states and marks the slot with STATE_TAG in word 7, reading the chip's form back when it is not
-//! there (a driver that zeroes or copies the words still works). Cycles: ~100 + frames x channels x
+//! states, by the slot's address, and marks the slot with STATE_TAG in word 7, reading the chip's form
+//! back when the tag is not there: a driver that zeroes the words starts the section from silence, one
+//! that saves and restores them in place goes on; words copied to another slot do not carry the state. Cycles: ~100 + frames x channels x
 //! (8 + 26 sections), the FM-1's (the EQ runs beside the CPU: it costs the CPU nothing).
 
 use crate::hwdsp::Mem;
@@ -127,7 +128,8 @@ impl HwEq {
         let ch = if in_ch == 0 { 1 } else { (self.regs[2] & 0xffff) / in_ch + 1 };
         for o in 0..och {
             let k = o % ch;
-            let mut x: Vec<f64> = (0..n).map(|s| load(m, ia + k * in_ch + s * in_step, fin)).collect();
+            let at = |s: u32| ia.wrapping_add(k.wrapping_mul(in_ch)).wrapping_add(s.wrapping_mul(in_step));
+            let mut x: Vec<f64> = (0..n).map(|s| load(m, at(s), fin)).collect();
             for sec in 0..nsec {
                 let j = o * nsec + sec;
                 let c: Vec<f64> = (0..5).map(|w| f32::from_bits(self.slot_word(m, j, w)) as f64).collect();
@@ -153,7 +155,7 @@ impl HwEq {
                 self.slot_store(m, j, 7, STATE_TAG);
             }
             for (s, v) in x.iter().enumerate() {
-                store(m, oa + o * out_ch + s as u32 * out_step, fout, *v);
+                store(m, oa.wrapping_add(o.wrapping_mul(out_ch)).wrapping_add((s as u32).wrapping_mul(out_step)), fout, *v);
             }
         }
         100 + (n as u64) * (och as u64) * (8 + 26 * nsec as u64)
