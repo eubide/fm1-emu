@@ -27,6 +27,7 @@ use fm1_core::Bus;
 
 pub mod script;
 pub mod flaky;
+pub mod hwdsp;
 pub mod fwsc;
 pub mod irqstorm;
 mod lcd;
@@ -92,6 +93,8 @@ enum Region {
     Irqc2,
     /// ALNK0 I2S out.
     Alnk,
+    /// JL_FFT, the FFT / vector unit (hwdsp.rs).
+    HwDsp,
     Sram2,
     Unknown,
 }
@@ -244,6 +247,8 @@ pub struct Soc {
     pub flaky_core1: Option<flaky::FlakyCore1>,
     /// The power domain's analog registers.
     pub p33: p33::P33,
+    /// The FFT / vector unit (JL_FFT, 0x1EE0400; hwdsp.rs).
+    pub hwdsp: hwdsp::HwDsp,
     /// USB0 and, with a cable (`usb_plug`), a host on the other end (usb.rs).
     pub usb: usb::Usb,
     /// Exact skipping of cpu0's polling loops (`machine::run_blocks`).
@@ -401,6 +406,7 @@ impl Soc {
             unknown_log: Vec::new(),
             flaky_core1: None,
             p33: Default::default(),
+            hwdsp: Default::default(),
             usb: Default::default(),
             // (FM1_TRACE: a trace shows every instruction as it runs, not a probe's)
             loop_skip: machine::LoopSkip::new(std::env::var_os("FM1_NO_LOOPSKIP").is_none() && std::env::var_os("FM1_TRACE").is_none()),
@@ -520,7 +526,8 @@ impl Soc {
             Region::Timer => matches!(addr, 0x10800 | 0x10900 | 0x10908) || matches!(addr & !0x300, 0x10400 | 0x10408),
             // the SMK-37's matrix rows and SPI1 busy follow the clock; its ADC is left alone too
             Region::Gpio | Region::Adc | Region::Spi1 => fm1,
-            Region::Spi0 | Region::Rand | Region::Unknown => false,
+            // (the FFT / vector unit's done bit comes with the clock)
+            Region::Spi0 | Region::Rand | Region::HwDsp | Region::Unknown => false,
         }
     }
 
@@ -676,6 +683,7 @@ impl Soc {
             0x1eee000..=0x1eee0ff => Region::Irqc,
             0x1eef000..=0x1eef3ff => Region::Irqc2,
             0x1eee240..=0x1eee24f => Region::Dbg,
+            hwdsp::BASE..=hwdsp::END => Region::HwDsp,
             _ => Region::Unknown,
         }
     }
@@ -1022,6 +1030,7 @@ impl Soc {
                 (if addr == 0x13b00 { x } else { x >> 32 }) as u32
             }
             Region::P33 => self.p33.read(addr),
+            Region::HwDsp => self.hwdsp.read(addr, self.periph.cycles),
             Region::Unknown => {
                 self.log_unknown(addr, 4, false, 0);
                 0
@@ -1177,6 +1186,13 @@ impl Soc {
                 }
                 self.sfr_set(addr, value);
                 self.sfc_reread();
+            }
+            Region::HwDsp => {
+                // (the unit reads and writes RAM through the bus: taken out while it runs)
+                let mut u = std::mem::take(&mut self.hwdsp);
+                let cycles = self.periph.cycles;
+                u.write(self, addr, value, cycles);
+                self.hwdsp = u;
             }
             Region::Unknown => self.log_unknown(addr, 4, true, value),
         }
@@ -1463,6 +1479,15 @@ mod tests {
         soc.write32(0x11d0c, RAM_BASE);
         soc.write32(0x11d10, 0x800);
         assert_eq!(soc.read32(0x11d00) & 0x8000, 0, "the DMA is still on the wire");
+    }
+}
+
+impl hwdsp::Mem for Soc {
+    fn rd(&mut self, a: u32) -> u32 {
+        self.read32(a)
+    }
+    fn wr(&mut self, a: u32, v: u32) {
+        self.write32(a, v)
     }
 }
 
