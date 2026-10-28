@@ -26,7 +26,13 @@
 //! then enumeration (device descriptor, SET_ADDRESS, the configuration and the product
 //! string, SET_CONFIGURATION), then a USB-MIDI device's bulk endpoints: one OUT packet a frame
 //! from what the computer sends (`midi_send`), one IN poll a frame into what it receives
-//! (`midi_take`). The device only answers at its own address (FADDR), so a firmware that gets
+//! (`midi_take`). USB audio (`audio_record`, fm1-live FM1_USB_WAV): a USB Audio Class 1
+//! device's audio streaming interface with an isochronous IN endpoint is recorded as a
+//! computer's recording program does: SET_INTERFACE to the alternate setting that has the
+//! endpoint, SET_CUR of its sampling frequency (when the format lists the rate asked for),
+//! then one isochronous IN transaction a frame, the PCM into `audio`. An isochronous IN
+//! endpoint (TXCSR2 bit 6) is never NAKed: with no packet queued it sends a zero-length one
+//! and sets UnderRun (TXCSR1 bit 2), which the firmware clears with its next TXCSR1 write. The device only answers at its own address (FADDR), so a firmware that gets
 //! SET_ADDRESS wrong drops off as it would on a real bus.
 //!
 //! Not modelled: the USB interrupt. The SIE sets its flags (INTRTX / INTRRX / INTRUSB) but
@@ -87,6 +93,8 @@ struct Ep {
     stall: bool,
     sent_stall: bool,
     setup_end: bool,
+    /// Isochronous IN: an IN token found no packet queued (TXCSR1 bit 2).
+    underrun: bool,
 }
 
 /// What the host gets back from a transaction.
@@ -111,6 +119,8 @@ enum Stage {
     #[default]
     Setup,
     DataIn,
+    /// A control write's data (SET_CUR), then the status stage IN.
+    DataOut,
     StatusOut,
     StatusIn,
 }
@@ -121,6 +131,8 @@ struct Ctl {
     stage: Stage,
     got: Vec<u8>,
     want: usize,
+    /// A control write's data.
+    out: Vec<u8>,
     /// Frames this stage has been NAKed (a stuck device is given up on).
     naks: u32,
 }
@@ -151,6 +163,31 @@ enum HostState {
     Configured,
     /// Enumeration failed: the reason (the host waits for the device to go and come back).
     Failed(String),
+}
+
+/// The recording of a USB audio device: where it is in starting its stream.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+enum AudioStep {
+    /// Not asked for, or nothing to record (no audio streaming interface).
+    #[default]
+    Off,
+    SetInterface,
+    SetRate,
+    Streaming,
+}
+
+/// A USB audio device's stream as its configuration describes it: the audio streaming
+/// interface's alternate setting with an isochronous IN endpoint, and its Type I format.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioStream {
+    pub interface: u8,
+    pub alt: u8,
+    pub ep: u8,
+    pub max_packet: u16,
+    pub channels: u8,
+    /// Bytes per sample (bSubframeSize).
+    pub sample_bytes: u8,
+    pub rates: Vec<u32>,
 }
 
 /// Something that happened on the bus, for the front end.
@@ -200,6 +237,18 @@ pub struct Usb {
     out_q: VecDeque<[u8; 4]>,
     in_q: VecDeque<[u8; 4]>,
     rx_sysex: Vec<u8>,
+    /// USB audio: the rate to record at (`audio_record`), the stream found, where it is.
+    audio_want: Option<u32>,
+    pub audio_stream: Option<AudioStream>,
+    audio_step: AudioStep,
+    /// The recording: interleaved 16-bit samples as the device sent them, at `audio_rate`.
+    pub audio: Vec<i16>,
+    pub audio_rate: u32,
+    /// Isochronous IN transactions, and those that found no packet (zero-length).
+    pub audio_packets: u64,
+    pub audio_empty: u64,
+    /// Of those, the ones where the device had nothing queued (UnderRun), not a queued empty one.
+    pub audio_underruns: u64,
     pub events: Vec<UsbEvent>,
     /// FM1_USB_TRACE: the host's transactions on stderr.
     pub trace: bool,
@@ -217,6 +266,16 @@ impl Usb {
         self.cable = true;
         self.sie_cycles = (hz * ns / 1_000_000_000).max(1);
         self.trace = std::env::var_os("FM1_USB_TRACE").is_some();
+        if std::env::var_os("FM1_USB_WAV").is_some() {
+            let rate = std::env::var("FM1_USB_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(44_100);
+            self.audio_record(rate);
+        }
+    }
+
+    /// Record the device's USB audio (if it has any) at `rate` Hz, as a computer's recording
+    /// program would, from when it is configured on.
+    pub fn audio_record(&mut self, rate: u32) {
+        self.audio_want = Some(rate);
     }
 
     fn con0(&self) -> u32 {
@@ -351,7 +410,7 @@ impl Usb {
             S_CSR0 if self.index == 0 => {
                 e.rx_rdy as u8 | (e.tx_rdy as u8) << 1 | (e.sent_stall as u8) << 2 | (e.setup_end as u8) << 4
             }
-            S_CSR0 => e.tx_rdy as u8 | (e.stall as u8) << 4 | (e.sent_stall as u8) << 5,
+            S_CSR0 => e.tx_rdy as u8 | (e.underrun as u8) << 2 | (e.stall as u8) << 4 | (e.sent_stall as u8) << 5,
             S_TXCSR2 => e.txcsr2,
             S_RXMAXP => e.rxmaxp,
             S_RXCSR1 => e.rx_rdy as u8 | (e.stall as u8) << 5 | (e.sent_stall as u8) << 6,
@@ -405,6 +464,9 @@ impl Usb {
                 e.stall = v & 0x10 != 0;
                 if v & 0x20 == 0 {
                     e.sent_stall = false;
+                }
+                if v & 0x04 == 0 {
+                    e.underrun = false; // (written 0)
                 }
             }
             S_TXCSR2 => self.ep[n].txcsr2 = v,
@@ -489,18 +551,52 @@ impl Usb {
             return Reply::Nak;
         }
         let e = &mut self.ep[n];
-        if e.stall {
+        let iso = e.txcsr2 & 0x40 != 0;
+        if e.stall && !iso {
             e.sent_stall = true;
             return Reply::Stall;
         }
         if !e.tx_rdy {
+            if iso {
+                e.underrun = true; // no handshake: a zero-length packet
+                self.audio_underruns += 1;
+                return Reply::Data(Vec::new());
+            }
             return Reply::Nak;
         }
-        let (at, len) = (self.tadr(n), self.cnt(n).min(64));
+        // (a bulk packet is at most 64 bytes at full speed, an isochronous one 1023)
+        let (at, len) = (self.tadr(n), self.cnt(n).min(if iso { 1023 } else { 64 }));
         let d = (0..len).map(|i| dma.dma_read8(at.wrapping_add(i as u32))).collect();
         self.ep[n].tx_rdy = false;
         self.intrtx |= 1 << n;
         Reply::Data(d)
+    }
+
+    /// A control write's data stage on EP0 (up to 64 bytes): into EP0's buffer, RxPktRdy, as
+    /// a SETUP packet is.
+    fn dev_ctl_out(&mut self, dma: &mut dyn Dma, addr: u8, data: &[u8]) -> Reply {
+        if !self.answers(addr) {
+            return Reply::Silent;
+        }
+        let e = &mut self.ep[0];
+        if e.stall {
+            e.stall = false;
+            e.sent_stall = true;
+            self.intrtx |= 1;
+            return Reply::Stall;
+        }
+        if e.rx_rdy {
+            return Reply::Nak; // the SETUP not serviced yet
+        }
+        let at = self.radr(0);
+        for (i, &b) in data.iter().enumerate() {
+            dma.dma_write8(at.wrapping_add(i as u32), b);
+        }
+        let e = &mut self.ep[0];
+        e.rx_rdy = true;
+        e.rx_count = data.len() as u16;
+        self.intrtx |= 1;
+        Reply::Ack
     }
 
     fn dev_out(&mut self, dma: &mut dyn Dma, addr: u8, n: usize, data: &[u8]) -> Reply {
@@ -597,6 +693,7 @@ impl Usb {
                 self.host = HostState::Detached;
                 self.ctl = None;
                 self.out_q.clear();
+                self.audio_step = AudioStep::Off;
             }
             return;
         }
@@ -619,7 +716,10 @@ impl Usb {
                 self.start_step(Step::DevDesc8);
             }
             HostState::Enum(step) => self.enumerate(dma, step),
-            HostState::Configured => self.midi_frame(dma),
+            HostState::Configured => {
+                self.midi_frame(dma);
+                self.audio_frame(dma);
+            }
             _ => {}
         }
     }
@@ -647,6 +747,10 @@ impl Usb {
             let reply = match c.stage {
                 Stage::Setup => self.dev_setup(dma, addr, &c.setup),
                 Stage::DataIn => self.dev_in(dma, addr, 0, false),
+                Stage::DataOut => {
+                    let d = c.out.clone();
+                    self.dev_ctl_out(dma, addr, &d)
+                }
                 Stage::StatusOut => self.dev_out(dma, addr, 0, &[]),
                 Stage::StatusIn => self.dev_in(dma, addr, 0, true),
             };
@@ -666,7 +770,9 @@ impl Usb {
                     c.naks = 0;
                     c.stage = match c.stage {
                         Stage::Setup if c.want == 0 => Stage::StatusIn,
+                        Stage::Setup if c.setup[0] & 0x80 == 0 => Stage::DataOut,
                         Stage::Setup => Stage::DataIn,
+                        Stage::DataOut => Stage::StatusIn,
                         Stage::StatusOut => {
                             self.log(|| format!("{req:04x} done: {} bytes", c.got.len()));
                             return Ok(Some(c.got));
@@ -747,6 +853,8 @@ impl Usb {
             }
             Step::SetConfig => {
                 self.find_midi();
+                self.audio_stream = find_audio(&self.conf);
+                self.audio_step = AudioStep::Off;
                 let vid = u16::from_le_bytes([self.dev_desc[8], self.dev_desc[9]]);
                 let pid = u16::from_le_bytes([self.dev_desc[10], self.dev_desc[11]]);
                 self.log(|| format!("configured: \"{}\" {vid:04x}:{pid:04x}, MIDI OUT ep {} IN ep {}",
@@ -754,6 +862,12 @@ impl Usb {
                 self.events.push(UsbEvent::Configured { product: self.product.clone(), vid, pid });
                 self.host = HostState::Configured;
                 self.ctl = None;
+                if let (Some(_), Some(a)) = (self.audio_want, &self.audio_stream) {
+                    self.log(|| format!("audio: IF {} alt {} ep {:#04x}, {} ch x {} B, {:?} Hz", a.interface, a.alt, a.ep,
+                                        a.channels, a.sample_bytes, a.rates));
+                    self.audio_step = AudioStep::SetInterface;
+                    self.audio_control(AudioStep::SetInterface);
+                }
                 return;
             }
         };
@@ -809,6 +923,117 @@ impl Usb {
             }
         }
     }
+}
+
+impl Usb {
+    /// Start the control transfer of one step of starting the stream.
+    fn audio_control(&mut self, step: AudioStep) {
+        let Some(a) = self.audio_stream.clone() else { return };
+        let rate = self.audio_want.unwrap_or(44_100);
+        let (s, out) = match step {
+            // SET_INTERFACE (standard, to the interface): its alternate setting with the endpoint
+            AudioStep::SetInterface => ([0x01, 0x0b, a.alt, 0, a.interface, 0, 0, 0], Vec::new()),
+            // SET_CUR (class, to the endpoint) of SAMPLING_FREQ_CONTROL: 3 bytes, little endian
+            AudioStep::SetRate => ([0x22, 0x01, 0x00, 0x01, a.ep, 0, 3, 0], rate.to_le_bytes()[..3].to_vec()),
+            _ => return,
+        };
+        self.ctl = Some(Ctl { setup: s, want: out.len(), out, ..Default::default() });
+    }
+
+    /// The recording's part of a frame: the stream's start (control transfers), then one
+    /// isochronous IN transaction a frame.
+    fn audio_frame(&mut self, dma: &mut dyn Dma) {
+        match self.audio_step {
+            AudioStep::Off => {}
+            AudioStep::SetInterface | AudioStep::SetRate => {
+                let step = self.audio_step;
+                match self.control(dma) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        let rate = self.audio_want.unwrap_or(44_100);
+                        let lists = self.audio_stream.as_ref().is_some_and(|a| a.rates.contains(&rate));
+                        self.audio_step = if step == AudioStep::SetInterface && lists {
+                            AudioStep::SetRate
+                        } else {
+                            // a rate the format does not list is not asked for: the device's own
+                            self.audio_rate = if lists { rate } else {
+                                self.audio_stream.as_ref().and_then(|a| a.rates.first().copied()).unwrap_or(0)
+                            };
+                            self.log(|| format!("audio: streaming at {} Hz", self.audio_rate));
+                            AudioStep::Streaming
+                        };
+                        self.audio_control(self.audio_step);
+                    }
+                    Err(e) => {
+                        self.log(|| format!("audio: {e}"));
+                        self.ctl = None;
+                        self.audio_step = AudioStep::Off;
+                    }
+                }
+            }
+            AudioStep::Streaming => {
+                let Some(a) = self.audio_stream.clone() else { return };
+                let addr = self.addr;
+                if let Reply::Data(d) = self.dev_in(dma, addr, (a.ep & 0xf) as usize, false) {
+                    self.audio_packets += 1;
+                    if d.is_empty() {
+                        self.audio_empty += 1;
+                    }
+                    if self.trace && d.len() % 4 == 0 && !(43..=46).contains(&(d.len() / 4)) {
+                        self.log(|| format!("audio: a packet of {} frames", d.len() / 4));
+                    }
+                    if a.sample_bytes == 2 {
+                        self.audio.extend(d.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The audio streaming interface (class 1, subclass 2) of a configuration: the first
+/// alternate setting with an isochronous IN endpoint, and the Type I format descriptor
+/// (CS_INTERFACE, FORMAT_TYPE) in it.
+pub fn find_audio(conf: &[u8]) -> Option<AudioStream> {
+    let mut i = 0usize;
+    let mut cur: Option<AudioStream> = None;
+    while i + 2 <= conf.len() {
+        let (len, ty) = (conf[i] as usize, conf[i + 1]);
+        if len < 2 || i + len > conf.len() {
+            break;
+        }
+        let d = &conf[i..i + len];
+        match ty {
+            4 if len >= 9 => {
+                if cur.as_ref().is_some_and(|a| a.ep != 0) {
+                    break; // the setting before had it all
+                }
+                cur = (d[5] == 1 && d[6] == 2).then(|| AudioStream { interface: d[2], alt: d[3], ..Default::default() });
+            }
+            0x24 if len >= 8 && d[2] == 2 && d[3] == 1 => {
+                if let Some(a) = cur.as_mut() {
+                    a.channels = d[4];
+                    a.sample_bytes = d[5];
+                    let n = d[7] as usize;
+                    let at = |k: usize| u32::from(d[k]) | u32::from(d[k + 1]) << 8 | u32::from(d[k + 2]) << 16;
+                    a.rates = if n == 0 && len >= 14 {
+                        vec![at(8), at(11)] // a continuous range: its ends
+                    } else {
+                        (0..n).filter(|k| 8 + 3 * k + 3 <= len).map(|k| at(8 + 3 * k)).collect()
+                    };
+                }
+            }
+            5 if len >= 7 && d[2] & 0x80 != 0 && d[3] & 3 == 1 => {
+                if let Some(a) = cur.as_mut() {
+                    a.ep = d[2];
+                    a.max_packet = u16::from_le_bytes([d[4], d[5]]);
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    cur.filter(|a| a.ep != 0)
 }
 
 /// A complete MIDI message as USB-MIDI event packets (cable 0).
@@ -895,6 +1120,7 @@ mod tests {
     const EP0_BUF: u32 = 0x100;
     const EP1_TX: u32 = 0x200;
     const EP1_RX: u32 = 0x300;
+    const EP4_TX: u32 = 0x400;
 
     /// A USB-MIDI device's firmware that polls the SIE, as Felucca's usb.c does: EP0's
     /// requests from a descriptor table, then MIDI on EP1 both ways.
@@ -903,10 +1129,20 @@ mod tests {
         conf: Vec<u8>,
         addr: Option<u8>,
         got: Vec<u8>,
+        /// USB audio: the alternate setting the host chose, SET_CUR's rate (its data stage
+        /// pending), and the next frame's value; `feed` off: no packet queued.
+        alt: u8,
+        rate: u32,
+        cur_data: bool,
+        next: u16,
+        feed: bool,
+        /// The rest of a descriptor longer than a packet (EP0 sends 64 bytes at a time).
+        rest: Vec<u8>,
     }
     impl Fw {
         fn new(conf: Vec<u8>) -> Self {
-            Fw { t: 0, conf, addr: None, got: Vec::new() }
+            Fw { t: 0, conf, addr: None, got: Vec::new(), alt: 0, rate: 0, cur_data: false, next: 0, feed: true,
+                 rest: Vec::new() }
         }
         fn w(&mut self, u: &mut Usb, r: u32, v: u8) {
             u.write(USB_LO + 4, r << 8 | v as u32, self.t);
@@ -934,10 +1170,23 @@ mod tests {
             if tx & 1 != 0 {
                 self.w(u, S_INDEX, 0);
                 let csr = self.r(u, S_CSR0);
-                if csr & 1 == 0 {
+                if csr & 1 == 0 && !self.rest.is_empty() {
+                    if csr & 2 == 0 {
+                        // the packet before went: the next one
+                        let d = std::mem::take(&mut self.rest);
+                        self.ep0_in(u, ram, &d, 0);
+                    }
+                } else if csr & 1 == 0 {
                     if let Some(a) = self.addr.take() {
                         self.w(u, S_FADDR, a); // after SET_ADDRESS's status stage
                     }
+                } else if self.cur_data {
+                    // SET_CUR's data stage: 3 bytes, the rate
+                    let n = self.r(u, S_COUNT0) as u32;
+                    let d: Vec<u8> = (0..n).map(|i| ram.dma_read8(EP0_BUF + i)).collect();
+                    self.rate = u32::from(d[0]) | u32::from(d[1]) << 8 | u32::from(d[2]) << 16;
+                    self.cur_data = false;
+                    self.w(u, S_CSR0, 0x40 | 0x08);
                 } else {
                     let s: Vec<u8> = (0..8).map(|i| ram.dma_read8(EP0_BUF + i)).collect();
                     let (wv, wl) = (u16::from_le_bytes([s[2], s[3]]), u16::from_le_bytes([s[6], s[7]]) as usize);
@@ -945,15 +1194,22 @@ mod tests {
                         (0x80, 6) => {
                             let d = self.desc(wv);
                             let n = d.len().min(wl);
-                            for (i, &b) in d[..n].iter().enumerate() {
-                                ram.dma_write8(EP0_BUF + i as u32, b);
-                            }
-                            u.write(USB_LO + 8, n as u32, self.t);
-                            self.w(u, S_CSR0, 0x40 | 0x08 | 0x02);
+                            self.ep0_in(u, ram, &d[..n], 0x40);
                         }
                         (0, 5) => {
                             self.addr = Some(s[2]);
                             self.w(u, S_CSR0, 0x40 | 0x08);
+                        }
+                        (0x01, 0x0b) => {
+                            self.alt = s[2];
+                            self.w(u, S_INDEX, 4);
+                            self.w(u, S_TXCSR2, 0x40); // isochronous
+                            self.w(u, S_INDEX, 0);
+                            self.w(u, S_CSR0, 0x40 | 0x08);
+                        }
+                        (0x22, 0x01) => {
+                            self.cur_data = true; // the data stage follows
+                            self.w(u, S_CSR0, 0x40);
                         }
                         _ => self.w(u, S_CSR0, 0x40 | 0x08),
                     }
@@ -965,7 +1221,37 @@ mod tests {
                 self.got.extend((0..n).map(|i| ram.dma_read8(EP1_RX + i)));
                 self.w(u, S_RXCSR1, 0);
             }
+            if self.alt == 1 && self.feed {
+                // a packet of 44 stereo frames on EP4 once the last one went: L = R = a counter
+                self.w(u, S_INDEX, 4);
+                if self.r(u, S_CSR0) & 1 == 0 {
+                    for k in 0..44u32 {
+                        for c in 0..2u32 {
+                            let v = self.next.to_le_bytes();
+                            ram.dma_write8(EP4_TX + 4 * k + 2 * c, v[0]);
+                            ram.dma_write8(EP4_TX + 4 * k + 2 * c + 1, v[1]);
+                        }
+                        self.next = self.next.wrapping_add(1);
+                    }
+                    u.write(USB_LO + 0x34, 176, self.t);
+                    self.w(u, S_CSR0, 1);
+                }
+            }
         }
+        /// IN data on EP0, 64 bytes at a time (the rest after the host has taken this packet):
+        /// `serviced` 0x40 with the first packet (ServicedRxPktRdy of its SETUP).
+        fn ep0_in(&mut self, u: &mut Usb, ram: &mut Ram, d: &[u8], serviced: u8) {
+            let n = d.len().min(64);
+            for (i, &b) in d[..n].iter().enumerate() {
+                ram.dma_write8(EP0_BUF + i as u32, b);
+            }
+            u.write(USB_LO + 8, n as u32, self.t);
+            self.rest = d[n..].to_vec();
+            // (a packet of exactly 64 that ends it: the host's short-packet rule needs a ZLP; not here)
+            let end = if self.rest.is_empty() { 0x08 } else { 0 };
+            self.w(u, S_CSR0, serviced | end | 0x02);
+        }
+
         /// One USB-MIDI packet to the computer on EP1.
         fn send(&mut self, u: &mut Usb, ram: &mut Ram, p: [u8; 4]) {
             for (i, &b) in p.iter().enumerate() {
@@ -993,6 +1279,7 @@ mod tests {
         u.write(USB_LO + 0x18, EP0_BUF, 0);
         u.write(USB_LO + 0x1c, EP1_TX, 0);
         u.write(USB_LO + 0x20, EP1_RX, 0);
+        u.write(USB_LO + 0x38, EP4_TX, 0);
         (u, Fw::new(conf), Ram(vec![0; 0x1000]))
     }
 
@@ -1025,6 +1312,56 @@ mod tests {
         u.frame(&mut ram, false);
         assert_eq!(u.events.last(), Some(&UsbEvent::Detached));
         assert_eq!(u.product(), None);
+    }
+
+    /// MIDI's configuration and a USB audio streaming interface: IF 2, alt 0 without an
+    /// endpoint, alt 1 with an isochronous IN endpoint 0x84 and a Type I format of 2 channels of
+    /// 16 bits at 44100 or 48000 Hz.
+    fn audio_conf() -> Vec<u8> {
+        let mut c = midi_conf(0);
+        c[4] = 3;
+        c.extend([9, 4, 2, 0, 0, 1, 2, 0, 0]);
+        c.extend([9, 4, 2, 1, 1, 1, 2, 0, 0]);
+        c.extend([7, 0x24, 1, 2, 1, 1, 0]);
+        c.extend([14, 0x24, 2, 1, 2, 2, 16, 2, 0x44, 0xac, 0x00, 0x80, 0xbb, 0x00]);
+        c.extend([9, 5, 0x84, 0x05, 196, 0, 1, 0, 0]);
+        c.extend([7, 0x25, 1, 0, 0, 0, 0]);
+        let n = c.len() as u16;
+        c[2..4].copy_from_slice(&n.to_le_bytes());
+        c
+    }
+
+    /// The host records a USB audio device: it finds the stream, chooses its alternate setting
+    /// (SET_INTERFACE), asks for 48 kHz (SET_CUR with its data stage), then takes a packet a
+    /// frame; a frame the device queued nothing for comes back empty, with UnderRun set.
+    #[test]
+    fn a_usb_audio_device_is_recorded() {
+        assert_eq!(find_audio(&audio_conf()), Some(AudioStream { interface: 2, alt: 1, ep: 0x84, max_packet: 196,
+                                                                channels: 2, sample_bytes: 2, rates: vec![44_100, 48_000] }));
+        assert_eq!(find_audio(&midi_conf(45)), None);
+        let (mut u, mut fw, mut ram) = device(audio_conf());
+        u.audio_record(48_000);
+        run(&mut u, &mut fw, &mut ram, 200);
+        assert_eq!(u.product(), Some("Test"));
+        assert_eq!((fw.alt, fw.rate, u.audio_rate), (1, 48_000, 48_000), "SET_INTERFACE, SET_CUR");
+        let pkts = u.audio_packets;
+        assert!(pkts > 10 && u.audio_empty == 0, "{pkts} packets, {} empty", u.audio_empty);
+        let left: Vec<i16> = u.audio.iter().step_by(2).copied().collect();
+        assert_eq!(left.len(), 44 * pkts as usize);
+        assert!(left.windows(2).all(|w| w[1] == w[0].wrapping_add(1)), "every frame, in order");
+
+        fw.feed = false; // nothing queued: an empty packet a frame, and UnderRun
+        run(&mut u, &mut fw, &mut ram, 5);
+        assert!(u.audio_empty >= 4 && u.audio_underruns == u.audio_empty, "{} empty", u.audio_empty);
+        fw.w(&mut u, S_INDEX, 4);
+        assert_eq!(fw.r(&mut u, S_CSR0) & 4, 4, "UnderRun");
+        fw.w(&mut u, S_CSR0, 0);
+        assert_eq!(fw.r(&mut u, S_CSR0) & 4, 0, "cleared by a write");
+
+        // not asked for: no SET_INTERFACE, nothing recorded
+        let (mut u, mut fw, mut ram) = device(audio_conf());
+        run(&mut u, &mut fw, &mut ram, 200);
+        assert_eq!((fw.alt, u.audio_packets), (0, 0));
     }
 
     /// A configuration whose wTotalLength is too short for one (or 0) fails the enumeration
