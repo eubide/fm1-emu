@@ -425,14 +425,20 @@ fn bench(o: &Opts, ms: u64) {
 
 // ---------------------------------------------------------------- audio --
 
-struct AudioRing {
-    q: Mutex<VecDeque<i16>>,
+/// 250 ms of 44.1 kHz stereo frames between the emulator and the audio device.
+const RING_FRAMES: usize = 44_100 / 4;
+
+struct AudioStats {
     /// Set once the firmware has produced sound (silence before that is boot).
     started: AtomicBool,
     underruns: AtomicU64,
 }
 
-fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
+fn ring_ms(p: &rtrb::Producer<[i16; 2]>) -> f64 {
+    (p.buffer().capacity() - p.slots()) as f64 / 44.1
+}
+
+fn start_audio(mut ring: rtrb::Consumer<[i16; 2]>, stats: Arc<AudioStats>) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let dev = host.default_output_device().ok_or("no audio output device")?;
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
@@ -447,15 +453,14 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
         .build_output_stream(
             &cfg.config(),
             move |out: &mut [f32], _| {
-                let mut q = ring.q.lock().unwrap();
                 let mut starved = false;
                 for frame in out.chunks_mut(channels) {
                     pos += step;
                     while pos >= 1.0 {
                         pos -= 1.0;
                         cur = next;
-                        next = match (q.pop_front(), q.pop_front()) {
-                            (Some(l), Some(r)) => (l as f32 / 32768.0, r as f32 / 32768.0),
+                        next = match ring.pop() {
+                            Ok([l, r]) => (l as f32 / 32768.0, r as f32 / 32768.0),
                             _ => {
                                 starved = true;
                                 (0.0, 0.0)
@@ -468,8 +473,8 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
                         *s = if c % 2 == 0 { l } else { r };
                     }
                 }
-                if starved && ring.started.load(Ordering::Relaxed) {
-                    ring.underruns.fetch_add(1, Ordering::Relaxed);
+                if starved && stats.started.load(Ordering::Relaxed) {
+                    stats.underruns.fetch_add(1, Ordering::Relaxed);
                 }
             },
             |e| eprintln!("audio: {e}"),
@@ -856,8 +861,9 @@ fn main() {
     };
     let mut pot = m.soc.periph.adc_value[4];
 
-    let ring = Arc::new(AudioRing { q: Mutex::new(VecDeque::new()), started: AtomicBool::new(false), underruns: AtomicU64::new(0) });
-    let _stream = match start_audio(ring.clone()) {
+    let (mut ring, ring_out) = rtrb::RingBuffer::new(RING_FRAMES);
+    let stats = Arc::new(AudioStats { started: AtomicBool::new(false), underruns: AtomicU64::new(0) });
+    let _stream = match start_audio(ring_out, stats.clone()) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("audio off: {e}");
@@ -889,7 +895,7 @@ fn main() {
 
     let audio_ok = _stream.is_some();
     let emu = {
-        let (ring, lcd, leds, pads, status, quit) = (ring.clone(), lcd.clone(), leds.clone(), pads.clone(), status.clone(), quit.clone());
+        let (stats, lcd, leds, pads, status, quit) = (stats.clone(), lcd.clone(), leds.clone(), pads.clone(), status.clone(), quit.clone());
         let flash = o.flash.clone();
         std::thread::spawn(move || {
             high_priority();
@@ -911,7 +917,7 @@ fn main() {
                 if real - emu_ms > 250.0 {
                     offset_ms += real - emu_ms - LEAD_MS; // too far behind: resync, do not race
                 }
-                let buffered = ring.q.lock().unwrap().len() as f64 / 88.2;
+                let buffered = ring_ms(&ring);
                 let behind = if audio_ok && m.soc.periph.audio_halves > 0 {
                     buffered < AUDIO_TARGET_MS
                 } else {
@@ -927,14 +933,12 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 if !m.soc.periph.audio.is_empty() {
-                    let mut q = ring.q.lock().unwrap();
-                    q.extend(m.soc.periph.audio.drain(..));
-                    ring.started.store(true, Ordering::Relaxed);
-                    let cap = 44_100 * 2 / 4; // 250 ms
-                    if q.len() > cap {
-                        let extra = q.len() - cap;
-                        q.drain(..extra);
+                    // a full ring (no device, or one that stalled) drops the newest frames
+                    for f in m.soc.periph.audio.chunks_exact(2) {
+                        let _ = ring.push([f[0], f[1]]);
                     }
+                    m.soc.periph.audio.clear();
+                    stats.started.store(true, Ordering::Relaxed);
                 }
                 if last_lcd.elapsed() >= Duration::from_millis(16) {
                     lcd.lock().unwrap().copy_from_slice(&m.soc.lcd.fb);
@@ -951,10 +955,10 @@ fn main() {
                 if last_stat.elapsed() >= Duration::from_millis(500) {
                     let e = m.soc.periph.ms();
                     let speed = (e - stat_emu) as f64 / stat_wall.elapsed().as_secs_f64() / 1000.0;
-                    let buffered = ring.q.lock().unwrap().len() as f64 / 88.2;
+                    let buffered = ring_ms(&ring);
                     *status.lock().unwrap() = format!(
                         "{:.2}x real time | {} MHz | audio {:.0} ms buffered, {} underruns",
-                        speed, m.soc.periph.hz / 1_000_000, buffered, ring.underruns.load(Ordering::Relaxed)
+                        speed, m.soc.periph.hz / 1_000_000, buffered, stats.underruns.load(Ordering::Relaxed)
                     );
                     if e / 2000 != stat_emu / 2000 {
                         eprintln!("[{:5.1} s] {}", e as f64 / 1000.0, status.lock().unwrap());
@@ -1307,5 +1311,23 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
             win.set_title(&format!("SMK-37 · {} — {}", o.name, status.lock().unwrap()));
             last_title = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_device_drains_the_ring() {
+        let (mut ring, ring_out) = rtrb::RingBuffer::new(RING_FRAMES);
+        let stats = Arc::new(AudioStats { started: AtomicBool::new(true), underruns: AtomicU64::new(0) });
+        let Ok(_stream) = start_audio(ring_out, stats) else {
+            return; // no audio output (a CI runner)
+        };
+        while ring.push([1000, -1000]).is_ok() {}
+        let full = ring_ms(&ring);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(ring_ms(&ring) < full, "{full} ms queued, none played");
     }
 }
